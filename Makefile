@@ -1,262 +1,119 @@
-##########################
-#  OLM - Build and Test  #
-##########################
+# Current Operator version
+VERSION ?= 0.0.1
+# Default bundle image tag
+BUNDLE_IMG ?= controller-bundle:$(VERSION)
+# Options for 'bundle-build'
+ifneq ($(origin CHANNELS), undefined)
+BUNDLE_CHANNELS := --channels=$(CHANNELS)
+endif
+ifneq ($(origin DEFAULT_CHANNEL), undefined)
+BUNDLE_DEFAULT_CHANNEL := --default-channel=$(DEFAULT_CHANNEL)
+endif
+BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
 
-# Undefine GOFLAGS environment variable.
-ifdef GOFLAGS
-$(warning Undefining GOFLAGS set in CI)
-undefine GOFLAGS
+# Image URL to use all building/pushing image targets
+IMG ?= controller:latest
+# Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
+CRD_OPTIONS ?= "crd:trivialVersions=true,preserveUnknownFields=false"
+
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
 endif
 
-SHELL := /bin/bash
-ORG := github.com/operator-framework
-PKG   := $(ORG)/operator-lifecycle-manager
-MOD_FLAGS := $(shell (go version | grep -q -E "1\.1[1-9]") && echo -mod=vendor)
-CMDS  := $(shell go list $(MOD_FLAGS) ./cmd/...)
-TCMDS := $(shell go list $(MOD_FLAGS) ./test/e2e/...)
-MOCKGEN := ./scripts/update_mockgen.sh
-CODEGEN := ./scripts/update_codegen.sh
-IMAGE_REPO := quay.io/operator-framework/olm
-IMAGE_TAG ?= "dev"
-SPECIFIC_UNIT_TEST := $(if $(TEST),-run $(TEST),)
-LOCAL_NAMESPACE := "olm"
-export GO111MODULE=on
-CONTROLLER_GEN := go run $(MOD_FLAGS) ./vendor/sigs.k8s.io/controller-tools/cmd/controller-gen
-YQ_INTERNAL := go run $(MOD_FLAGS) ./vendor/github.com/mikefarah/yq/v3/
-KUBEBUILDER_ASSETS := $(or $(or $(KUBEBUILDER_ASSETS),$(dir $(shell command -v kubebuilder))),/usr/local/kubebuilder/bin)
-export KUBEBUILDER_ASSETS
+all: manager
 
-# ART builds are performed in dist-git, with content (but not commits) copied 
-# from the source repo. Thus at build time if your code is inspecting the local
-# git repo it is getting unrelated commits and tags from the dist-git repo, 
-# not the source repo.
-# For ART image builds, SOURCE_GIT_COMMIT, SOURCE_GIT_TAG, SOURCE_DATE_EPOCH 
-# variables are inserted in Dockerfile to enable recovering the original git 
-# metadata at build time.
-GIT_COMMIT := $(if $(SOURCE_GIT_COMMIT),$(SOURCE_GIT_COMMIT),$(shell git rev-parse HEAD))
+# Run tests
+ENVTEST_ASSETS_DIR=$(shell pwd)/testbin
+test: generate fmt vet manifests
+	mkdir -p ${ENVTEST_ASSETS_DIR}
+	test -f ${ENVTEST_ASSETS_DIR}/setup-envtest.sh || curl -sSLo ${ENVTEST_ASSETS_DIR}/setup-envtest.sh https://raw.githubusercontent.com/kubernetes-sigs/controller-runtime/v0.7.0/hack/setup-envtest.sh
+	source ${ENVTEST_ASSETS_DIR}/setup-envtest.sh; fetch_envtest_tools $(ENVTEST_ASSETS_DIR); setup_envtest_env $(ENVTEST_ASSETS_DIR); go test ./... -coverprofile cover.out
 
-.PHONY: build test run clean vendor schema-check \
-	vendor-update coverage coverage-html e2e \
-	kubebuilder .FORCE
+# Build manager binary
+manager: generate fmt vet
+	go build -o bin/manager main.go
 
-all: test build
+# Run against the configured Kubernetes cluster in ~/.kube/config
+run: generate fmt vet manifests
+	go run ./main.go
 
-test: clean cover.out
+# Install CRDs into a cluster
+install: manifests kustomize
+	$(KUSTOMIZE) build config/crd | kubectl apply -f -
 
-unit: kubebuilder
-	KUBEBUILDER_ASSETS=$(KUBEBUILDER_ASSETS) go test $(MOD_FLAGS) $(SPECIFIC_UNIT_TEST) -tags "json1" -v -race -count=1 ./pkg/...
+# Uninstall CRDs from a cluster
+uninstall: manifests kustomize
+	$(KUSTOMIZE) build config/crd | kubectl delete -f -
 
-# Ensure kubebuilder is installed before continuing
-KUBEBUILDER_ASSETS_ERR := not detected in $(KUBEBUILDER_ASSETS), to override the assets path set the KUBEBUILDER_ASSETS environment variable, for install instructions see https://book.kubebuilder.io/quick-start.html
-kubebuilder:
-ifeq (, $(wildcard $(KUBEBUILDER_ASSETS)/kubebuilder))
-	$(error kubebuilder $(KUBEBUILDER_ASSETS_ERR))
-endif
-ifeq (, $(wildcard $(KUBEBUILDER_ASSETS)/etcd))
-	$(error etcd $(KUBEBUILDER_ASSETS_ERR))
-endif
-ifeq (, $(wildcard $(KUBEBUILDER_ASSETS)/kube-apiserver))
-	$(error kube-apiserver $(KUBEBUILDER_ASSETS_ERR))
-endif
+# Deploy controller in the configured Kubernetes cluster in ~/.kube/config
+deploy: manifests kustomize
+	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	$(KUSTOMIZE) build config/default | kubectl apply -f -
 
-schema-check:
+# UnDeploy controller from the configured Kubernetes cluster in ~/.kube/config
+undeploy:
+	$(KUSTOMIZE) build config/default | kubectl delete -f -
 
-cover.out: schema-check
-	go test $(MOD_FLAGS) -tags "json1" -v -race -coverprofile=cover.out -covermode=atomic \
-		-coverpkg ./pkg/controller/... ./pkg/...
+# Generate manifests e.g. CRD, RBAC etc.
+manifests: controller-gen
+	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
-coverage: cover.out
-	go tool cover -func=cover.out
+# Run go fmt against code
+fmt:
+	go fmt ./...
 
-coverage-html: cover.out
-	go tool cover -html=cover.out
+# Run go vet against code
+vet:
+	go vet ./...
 
-build: build_cmd=build
-build: clean $(CMDS)
+# Generate code
+generate: controller-gen
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
-test-bare: BUILD_TAGS=-tags=bare
-test-bare: clean $(TCMDS)
+# Build the docker image
+docker-build: test
+	docker build -t ${IMG} .
 
-test-bin: clean $(TCMDS)
+# Push the docker image
+docker-push:
+	docker push ${IMG}
 
-# build versions of the binaries with coverage enabled
-build-coverage: build_cmd=test -c -covermode=count -coverpkg ./pkg/controller/...
-build-coverage: clean $(CMDS)
+# Download controller-gen locally if necessary
+CONTROLLER_GEN = $(shell pwd)/bin/controller-gen
+controller-gen:
+	$(call go-get-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.4.1)
 
-build-linux: build_cmd=build
-build-linux: arch_flags=GOOS=linux GOARCH=386
-build-linux: clean $(CMDS)
+# Download kustomize locally if necessary
+KUSTOMIZE = $(shell pwd)/bin/kustomize
+kustomize:
+	$(call go-get-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v3@v3.8.7)
 
-build-wait: clean bin/wait
+# go-get-tool will 'go get' any package $2 and install it to $1.
+PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
+define go-get-tool
+@[ -f $(1) ] || { \
+set -e ;\
+TMP_DIR=$$(mktemp -d) ;\
+cd $$TMP_DIR ;\
+go mod init tmp ;\
+echo "Downloading $(2)" ;\
+GOBIN=$(PROJECT_DIR)/bin go get $(2) ;\
+rm -rf $$TMP_DIR ;\
+}
+endef
 
-bin/wait:
-	GOOS=linux GOARCH=386 go build $(MOD_FLAGS) -o $@ $(PKG)/test/e2e/wait
+# Generate bundle manifests and metadata, then validate generated files.
+.PHONY: bundle
+bundle: manifests kustomize
+	operator-sdk generate kustomize manifests -q
+	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
+	$(KUSTOMIZE) build config/manifests | operator-sdk generate bundle -q --overwrite --version $(VERSION) $(BUNDLE_METADATA_OPTS)
+	operator-sdk bundle validate ./bundle
 
-build-util-linux: arch_flags=GOOS=linux GOARCH=386
-build-util-linux: build-util
-
-build-util: bin/cpb
-
-bin/cpb:
-	CGO_ENABLED=0 $(arch_flags) go build $(MOD_FLAGS) -ldflags '-extldflags "-static"' -o $@ ./util/cpb
-
-$(CMDS): version_flags=-ldflags "-X $(PKG)/pkg/version.GitCommit=$(GIT_COMMIT) -X $(PKG)/pkg/version.OLMVersion=`cat OLM_VERSION`"
-$(CMDS):
-	$(arch_flags) go $(build_cmd) $(MOD_FLAGS) $(version_flags) -tags "json1" -o bin/$(shell basename $@) $@
-
-build: clean $(CMDS)
-
-$(TCMDS):
-	go test -c $(BUILD_TAGS) $(MOD_FLAGS) -o bin/$(shell basename $@) $@
-
-deploy-local:
-	mkdir -p build/resources
-	. ./scripts/package_release.sh 1.0.0 build/resources doc/install/local-values.yaml
-	. ./scripts/install_local.sh $(LOCAL_NAMESPACE) build/resources
-	rm -rf build
-
-e2e.namespace:
-	@printf "e2e-tests-$(shell date +%s)-$$RANDOM" > e2e.namespace
-
-# useful if running e2e directly with `go test -tags=bare`
-setup-bare: clean e2e.namespace
-	. ./scripts/build_bare.sh
-	. ./scripts/package_release.sh 1.0.0 test/e2e/resources test/e2e/e2e-bare-values.yaml
-	. ./scripts/install_bare.sh $(shell cat ./e2e.namespace) test/e2e/resources
-
-# e2e test exculding the rh-operators directory which tests rh-operators and their metric cardinality.
-e2e:
-	go test -v $(MOD_FLAGS)  -failfast -timeout 150m ./test/e2e/... -namespace=openshift-operators -kubeconfig=${KUBECONFIG} -olmNamespace=openshift-operator-lifecycle-manager -dummyImage=bitnami/nginx:latest -ginkgo.flakeAttempts=3
-
-e2e-local: build-linux build-wait build-util-linux
-	. ./scripts/build_local.sh
-	. ./scripts/run_e2e_local.sh $(TEST)
-
-e2e-bare: setup-bare
-	. ./scripts/run_e2e_bare.sh $(TEST)
-
-e2e-local-docker:
-	. ./scripts/build_local.sh
-	. ./scripts/run_e2e_docker.sh $(TEST)
-
-e2e-operator-metrics:
-	go test -v $(MOD_FLAGS) -timeout 70m ./test/rh-operators/...
-
-vendor:
-	go mod tidy
-	go mod vendor
-
-container:
-	docker build -t $(IMAGE_REPO):$(IMAGE_TAG) .
-
-clean-e2e:
-	kubectl delete crds --all
-	kubectl delete apiservices.apiregistration.k8s.io v1.packages.operators.coreos.com || true
-	kubectl delete -f test/e2e/resources/0000_50_olm_00-namespace.yaml
-
-clean:
-	@rm -rf cover.out
-	@rm -rf bin
-	@rm -rf test/e2e/resources
-	@rm -rf test/e2e/test-resources
-	@rm -rf test/e2e/log
-	@rm -rf e2e.namespace
-
-
-# Copy CRD manifests
-manifests: vendor
-	./scripts/copy_crds.sh
-
-# Generate deepcopy, conversion, clients, listers, and informers
-codegen:
-	# Clients, listers, and informers
-	$(CODEGEN)
-
-# Generate mock types.
-mockgen:
-	$(MOCKGEN)
-
-# Generates everything.
-gen-all: codegen mockgen manifests
-
-diff:
-	git diff --exit-code
-
-verify-codegen: codegen diff
-verify-mockgen: mockgen diff
-verify-manifests: manifests diff
-verify: verify-codegen verify-mockgen verify-manifests
-
-# before running release, bump the version in OLM_VERSION and push to master,
-# then tag those builds in quay with the version in OLM_VERSION
-release: ver=$(shell cat OLM_VERSION)
-release: manifests
-	docker pull quay.io/operator-framework/olm:v$(ver)
-	$(MAKE) target=upstream ver=$(ver) quickstart=true package
-	$(MAKE) target=ocp ver=$(ver) package
-	rm -rf manifests
-	mkdir manifests
-	cp -R deploy/ocp/manifests/$(ver)/. manifests
-	# requires gnu sed if on mac
-	find ./manifests -type f -exec sed -i "/^#/d" {} \;
-	find ./manifests -type f -exec sed -i "1{/---/d}" {} \;
-
-verify-release: release diff
-
-package: olmref=$(shell docker inspect --format='{{index .RepoDigests 0}}' quay.io/operator-framework/olm:v$(ver))
-package:
-ifndef target
-	$(error target is undefined)
-endif
-ifndef ver
-	$(error ver is undefined)
-endif
-	$(YQ_INTERNAL) w -i deploy/$(target)/values.yaml olm.image.ref $(olmref)
-	$(YQ_INTERNAL) w -i deploy/$(target)/values.yaml catalog.image.ref $(olmref)
-	$(YQ_INTERNAL) w -i deploy/$(target)/values.yaml package.image.ref $(olmref)
-	./scripts/package_release.sh $(ver) deploy/$(target)/manifests/$(ver) deploy/$(target)/values.yaml
-	ln -sfFn ./$(ver) deploy/$(target)/manifests/latest
-ifeq ($(target), ocp)
-	./scripts/add_release_annotation.sh deploy/$(target)/manifests/$(ver) "$(YQ_INTERNAL)"
-endif
-ifeq ($(quickstart), true)
-	./scripts/package_quickstart.sh deploy/$(target)/manifests/$(ver) deploy/$(target)/quickstart/olm.yaml deploy/$(target)/quickstart/crds.yaml deploy/$(target)/quickstart/install.sh
-endif
-
-################################
-#  OLM - Install/Uninstall/Run #
-################################
-
-.PHONY: run-console-local
-run-console-local:
-	@echo Running script to run the OLM console locally:
-	. ./scripts/run_console_local.sh
-
-.PHONY: uninstall
-uninstall:
-	@echo Uninstalling OLM:
-	- kubectl delete -f deploy/upstream/quickstart/crds.yaml
-	- kubectl delete -f deploy/upstream/quickstart/olm.yam
-	- kubectl delete catalogsources.operators.coreos.com
-	- kubectl delete clusterserviceversions.operators.coreos.com
-	- kubectl delete installplans.operators.coreos.com
-	- kubectl delete operatorgroups.operators.coreos.com subscriptions.operators.coreos.com
-	- kubectl delete apiservices.apiregistration.k8s.io v1.packages.operators.coreos.com
-	- kubectl delete ns olm
-	- kubectl delete ns openshift-operator-lifecycle-manager
-	- kubectl delete ns openshift-operators
-	- kubectl delete ns operators
-	- kubectl delete clusterrole.rbac.authorization.k8s.io/aggregate-olm-edit
-	- kubectl delete clusterrole.rbac.authorization.k8s.io/aggregate-olm-view
-	- kubectl delete clusterrole.rbac.authorization.k8s.io/system:controller:operator-lifecycle-manager
-	- kubectl delete clusterroles.rbac.authorization.k8s.io "system:controller:operator-lifecycle-manager"
-	- kubectl delete clusterrolebindings.rbac.authorization.k8s.io "olm-operator-binding-openshift-operator-lifecycle-manager"
-
-.PHONY: run-local
-run-local: build-linux build-wait build-util-linux
-	rm -rf build
-	. ./scripts/build_local.sh
-	mkdir -p build/resources
-	. ./scripts/package_release.sh 1.0.0 build/resources doc/install/local-values.yaml
-	. ./scripts/install_local.sh $(LOCAL_NAMESPACE) build/resources
-	rm -rf build
+# Build the bundle image.
+.PHONY: bundle-build
+bundle-build:
+	docker build -f bundle.Dockerfile -t $(BUNDLE_IMG) .

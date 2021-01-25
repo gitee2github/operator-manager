@@ -1,0 +1,7 @@
+apiVersion: cache.example.com/v1
+kind: InstallPlan
+metadata:
+  name: installplan-sample
+spec:
+  # Add fields here
+  foo: bar

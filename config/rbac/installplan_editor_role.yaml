@@ -1,0 +1,24 @@
+# permissions for end users to edit installplans.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: installplan-editor-role
+rules:
+- apiGroups:
+  - cache.example.com
+  resources:
+  - installplans
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cache.example.com
+  resources:
+  - installplans/status
+  verbs:
+  - get
