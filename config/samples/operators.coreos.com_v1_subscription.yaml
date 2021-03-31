@@ -4,8 +4,8 @@ metadata:
   name: subscription-sample
 spec:
   # Add fields here
-  startingCSV: etcd.0.9.2
+  startingCSV: api-operator.1.2.0
   option: create
   foo: bar
 status:
-  opstatus: not operate
+  opstatus: unknown

@@ -25,6 +25,7 @@ const (
 	StepStatusUnknown             StepStatus = "Unknown"
 	StepStatusCreated             StepStatus = "Created"
 	StepStatusDelete              StepStatus = "Delete"
+	StepStatusDeleting            StepStatus = "Deleting"
 	StepStatusNotPresent          StepStatus = "NotPresent"
 	StepStatusPresent             StepStatus = "Present"
 	StepStatusWaitingForAPI       StepStatus = "WaitingForApi"
@@ -38,8 +39,9 @@ const (
 type BluePrintSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	ClusterServiceVersionNames []string `json:"clusterServiceVersionNames"`
-	Generation                 int      `json:"generation,omitempty"`
+	ClusterServiceVersion string `json:"clusterServiceVersionName"`
+	OldVersion            string `json:"oldVersion"`
+	Generation            int    `json:"generation,omitempty"`
 
 	// Foo is an example field of BluePrint. Edit blueprint_types.go to remove/update
 	Foo string `json:"foo,omitempty"`
@@ -52,7 +54,7 @@ type BluePrintPhase string
 type BluePrintStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Plan  []*Step        `json:"plan,omitempty"`
+	Plan  Step           `json:"plan,omitempty"`
 	Phase BluePrintPhase `json:"phase"`
 	// BundleLookups is the set of in-progress requests to pull and unpackage bundle content to the cluster.
 	// BundleLookups是一个进行中的请求集合（去拉或解开bundle的内容到集群中）

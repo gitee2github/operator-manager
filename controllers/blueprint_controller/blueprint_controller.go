@@ -19,21 +19,23 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	yamlDecoder "k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/tools/clientcmd"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-logr/logr"
+	"gopkg.in/yaml.v2"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	yamlDecoder "k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	utilclock "k8s.io/apimachinery/pkg/util/clock"
 
 	operatorv1 "github.com/buptGophers/operator-manager/api/v1"
 	v1alpha1 "github.com/buptGophers/operator-manager/api/v1alpha1"
@@ -44,7 +46,6 @@ type BluePrintReconciler struct {
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
-	//manifestResolver  ManifestResolver
 }
 
 type notSupportedStepperErr struct {
@@ -58,141 +59,257 @@ func (n notSupportedStepperErr) Error() string {
 // +kubebuilder:rbac:groups=operator.operator-manager.domain,resources=blueprints/status,verbs=get;update;patch
 func (r *BluePrintReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	_ = context.Background()
-	// Get subscription
-	reqLogger := r.Log.WithValues("attempting to install", req.Namespace)
-	// List BluePrint
+	reqLogger := r.Log.WithValues("Attempting to install!", req.NamespacedName)
+
 	blueprintList := &operatorv1.BluePrintList{}
 	err := r.Client.List(context.TODO(), blueprintList)
 	if err != nil {
 		if err := client.IgnoreNotFound(err); err != nil {
-			reqLogger.Info("Cannot found any BluePrint in ", req.Namespace)
+			reqLogger.Info("Cannot found any BluePrint!")
 			return ctrl.Result{}, nil
 		}
-		reqLogger.Error(err, "unexpected error!")
+		reqLogger.Error(err, "Unexpected error!")
 		return ctrl.Result{}, err
 	}
-	if len(blueprintList.Items) != 0 {
-		for _, blueprint := range blueprintList.Items {
-			if len(blueprint.Spec.ClusterServiceVersionNames) == 0 {
-				//there is a wrong blueprint need to delete?
+
+	for _, blueprint := range blueprintList.Items {
+		if blueprint.Spec.ClusterServiceVersion == "" {
+			//there is a wrong blueprint need to delete?
+			return ctrl.Result{}, err
+		}
+		// Get operator path for related CSV and CRDs
+		ClusterServiceVersion := blueprint.Spec.ClusterServiceVersion
+		path := r.getRelatedReference(ClusterServiceVersion)
+		filepathNames, err := filepath.Glob(filepath.Join(path, "*"))
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		switch blueprint.Status.Plan.Status {
+		case operatorv1.StepStatusDelete:
+			// Uninstall the operator in the subscribed namespace
+			csvList := &v1alpha1.ClusterServiceVersionList{}
+			err := r.Client.List(context.TODO(), csvList)
+			if err != nil {
+				if err := client.IgnoreNotFound(err); err == nil {
+					reqLogger.Info("185: Cannot found any ClusterServiceVersion in ", req.NamespacedName)
+					return ctrl.Result{}, nil
+				}
+				reqLogger.Error(err, "Unexpected error!")
 				return ctrl.Result{}, err
 			}
-			for i, step := range blueprint.Status.Plan {
-				//find path
-				ClusterServiceVersionNames := blueprint.Spec.ClusterServiceVersionNames[0]
-				path := r.getRelatedReference(ClusterServiceVersionNames)
-				manifests := filepath.Join(path, "/manifests")
-				filepathNames, err := filepath.Glob(filepath.Join(manifests, "*"))
+			for _, path := range filepathNames {
+				res, err := r.ParsingYaml(path)
+				if res == "" && err != nil {
+					return ctrl.Result{}, err
+				} else if res == "" && err == nil {
+					reqLogger.Info("Can't parse yaml file correctly!")
+					return ctrl.Result{}, nil
+				}
+				switch res {
+				case "crdV1":
+					err = r.deleteCRDV1(path)
+					if err != nil {
+						return ctrl.Result{}, err
+					}
+				case "crdV1Beta1":
+					err = r.deleteCRDV1Beta1(path)
+					if err != nil {
+						return ctrl.Result{}, err
+					}
+				case "csvV1alpha1":
+					err := r.deleteClusterServiceVersionV1alpha1(reqLogger, blueprint.Spec.ClusterServiceVersion)
+					if err != nil {
+						return ctrl.Result{}, err
+					}
+				default:
+					reqLogger.Info("csv version")
+				}
+			}
+			if err := r.Client.Delete(context.TODO(), &blueprint); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+
+		case operatorv1.StepStatusPresent:
+			// Need to uninstall operator and its resources before update
+			if r.deleteClusterServiceVersionV1alpha1(reqLogger, blueprint.Spec.OldVersion) != nil {
+				return ctrl.Result{}, err
+			}
+			oldVersionPath := r.getRelatedReference(blueprint.Spec.OldVersion)
+			oldVersionPathNames, err := filepath.Glob(filepath.Join(oldVersionPath, "*"))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			for _, path := range oldVersionPathNames {
+				res, err := r.ParsingYaml(path)
 				if err != nil {
 					return ctrl.Result{}, err
 				}
-				switch step.Status {
-				case operatorv1.StepStatusCreated:
-					continue
-				case operatorv1.StepStatusUnknown:
-					for i := range filepathNames {
-						res, err := r.ParsingYaml(filepathNames[i])
-						if res == "" && err != nil {
-							return ctrl.Result{}, err
-						} else if res == "" && err == nil {
-							reqLogger.Info("Can't parse yaml file correctly!")
-							return ctrl.Result{}, nil
-						}
-						switch res {
-						case "crdV1":
-							err = r.createCRDV1(filepathNames[i])
-							if err != nil {
-								return ctrl.Result{}, err
-							}
-						case "crdV1Beta1":
-							err = r.createCRDV1Beta1(filepathNames[i])
-							if err != nil {
-								return ctrl.Result{}, err
-							}
-						case "csvV1alpha1":
-							_, err := r.createClusterServiceVersionV1alpha1(step, manifests, &blueprint)
-							if err != nil {
-								return ctrl.Result{}, err
-							}
-						}
-					}
-					blueprint.Status.Plan[i].Status = operatorv1.StepStatusCreated
-					if err := r.Client.Update(context.TODO(), &blueprint); err != nil {
+				if res == "" {
+					return ctrl.Result{}, nil
+				}
+				switch res {
+				case "crdV1":
+					err = r.deleteCRDV1(path)
+					if err != nil {
 						return ctrl.Result{}, err
 					}
-				case operatorv1.StepStatusDelete:
-					for i := range filepathNames {
-						res, err := r.ParsingYaml(filepathNames[i])
-						if res == "" && err != nil {
-							return ctrl.Result{}, err
-						} else if res == "" && err == nil {
-							reqLogger.Info("Can't parse yaml file correctly!")
-							return ctrl.Result{}, nil
-						}
-						switch res {
-						case "crdV1":
-							err = r.deleteCRDV1(filepathNames[i])
-							if err != nil {
-								return ctrl.Result{}, err
-							}
-						case "crdV1Beta1":
-							err = r.deleteCRDV1Beta1(filepathNames[i])
-							if err != nil {
-								return ctrl.Result{}, err
-							}
-						case "csvV1alpha1":
-							err = r.deleteClusterServiceVersionV1alpha1(step, manifests, &blueprint)
-							if err != nil {
-								return ctrl.Result{}, err
-							}
-						}
-					}
-					if err := r.Client.Delete(context.TODO(), &blueprint); err != nil {
+				case "crdV1Beta1":
+					err = r.deleteCRDV1Beta1(path)
+					if err != nil {
 						return ctrl.Result{}, err
 					}
-					reqLogger.Info("Delete a blueprint successful!")
-				default:
-					reqLogger.Info("Blueprint status belongs to an undefined state!")
-					return ctrl.Result{}, err
 				}
 			}
+			if r.deleteOldVersion(reqLogger, blueprint.Spec.OldVersion) != nil {
+				return ctrl.Result{}, err
+			}
+			blueprint.Status.Plan.Status = operatorv1.StepStatusUnknown
+			fallthrough
+
+		case operatorv1.StepStatusUnknown:
+			// Install operator and apply its resources
+			blueprint.Status.Plan.Status = operatorv1.StepStatusCreated
+			if err := r.Client.Update(context.TODO(), &blueprint); err != nil {
+				reqLogger.Info("_____________________Update error!")
+				return ctrl.Result{}, err
+			}
+
+			for _, f := range filepathNames {
+				res, err := r.ParsingYaml(f)
+				if res == "" && err != nil {
+					return ctrl.Result{}, err
+				} else if res == "" && err == nil {
+					reqLogger.Info("Can't parse yaml file correctly!")
+					return ctrl.Result{}, nil
+				}
+				switch res {
+				case "crdV1":
+					err = r.createCRDV1(f)
+					if err != nil {
+						return ctrl.Result{}, err
+					}
+				case "crdV1Beta1":
+					err = r.createCRDV1Beta1(f)
+					if err != nil {
+						return ctrl.Result{}, err
+					}
+				//case "csvV1alpha1":
+				// _, err := r.createClusterServiceVersionV1alpha1(reqLogger, &blueprint.Status.Plan, path, &blueprint)
+				// if err != nil {
+				//    return ctrl.Result{}, err
+				// }
+				default:
+					break
+				}
+			}
+
+			for _, f := range filepathNames {
+				res, err := r.ParsingYaml(f)
+				if res == "" && err != nil {
+					return ctrl.Result{}, err
+				} else if res == "" && err == nil {
+					reqLogger.Info("Can't parse yaml file correctly!")
+					return ctrl.Result{}, nil
+				}
+				if res == "csvV1alpha1" {
+					_, err := r.createClusterServiceVersionV1alpha1(reqLogger, &blueprint.Status.Plan, path, &blueprint)
+					if err != nil {
+						return ctrl.Result{}, err
+					}
+				}
+			}
+
+			reqLogger.Info("Successfully create subscribed CSV and CRDs!")
+
+		case operatorv1.StepStatusCreated:
+			break
+
+		default:
+			reqLogger.Info("Unexpected status for blueprint")
 		}
 	}
 	return ctrl.Result{}, nil
 }
 
-func (r *BluePrintReconciler) createClusterServiceVersionV1alpha1(step *operatorv1.Step, path string, blueprint *operatorv1.BluePrint) (*v1alpha1.ClusterServiceVersion, error) {
-	csv := &v1alpha1.ClusterServiceVersion{}
+func (r *BluePrintReconciler) createClusterServiceVersionV1alpha1(reqLogger logr.Logger, step *operatorv1.Step, path string, blueprint *operatorv1.BluePrint) (*v1alpha1.ClusterServiceVersion, error) {
 	csv, err := r.findCSV(*step, path)
 	if err != nil {
 		return nil, err
 	}
 	csv.SetNamespace(blueprint.Namespace)
+
+	csvList := &v1alpha1.ClusterServiceVersionList{}
+	err = r.Client.List(context.TODO(), csvList)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("CSV resource is not found.")
+			err = r.Client.Create(context.TODO(), csv)
+			if err != nil {
+				reqLogger.Info("1, Unexpected err while create csv")
+				return nil, err
+			}
+			return csv, nil
+		}
+		reqLogger.Error(err, "Failed to get csv.")
+		return nil, err
+	}
+	for _, c := range csvList.Items {
+		if c.Name == csv.Name {
+			return &c, nil
+		}
+	}
 	err = r.Client.Create(context.TODO(), csv)
 	if err != nil {
+		reqLogger.Info("2, Unexpected err while create csv")
 		return nil, err
 	}
 	return csv, nil
 }
 
-func (r *BluePrintReconciler) deleteClusterServiceVersionV1alpha1(step *operatorv1.Step, path string, blueprint *operatorv1.BluePrint) error {
-	csv := &v1alpha1.ClusterServiceVersion{}
-	csv, err := r.findCSV(*step, path)
+func (r *BluePrintReconciler) deleteClusterServiceVersionV1alpha1(reqLogger logr.Logger, name string) error {
+	csvList := &v1alpha1.ClusterServiceVersionList{}
+	err := r.Client.List(context.TODO(), csvList)
 	if err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("CSV resource is not found.")
+			return nil
+		}
+		reqLogger.Error(err, "Failed to list csv.")
 		return err
 	}
-	csv.SetNamespace(blueprint.Namespace)
-	err = r.Client.Delete(context.TODO(), csv)
-	if err != nil {
-		return err
+	for _, c := range csvList.Items {
+		if name[:4] == c.Name[:4] && name[len(name)-4:] == c.Name[len(c.Name)-4:] {
+			c.SetPhase(v1alpha1.CSVPhaseDeleting, v1alpha1.CSVReasonReplaced, "delete clusterserviceversion", now())
+			if r.Client.Update(context.TODO(), &c) != nil {
+				return err
+			}
+			return nil
+		}
 	}
 	return nil
 }
 
-func (r *BluePrintReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&operatorv1.BluePrint{}).
-		Complete(r)
+func (r *BluePrintReconciler) deleteOldVersion(reqLogger logr.Logger, oldVersionName string) error {
+	blueprintList := &operatorv1.BluePrintList{}
+	err := r.Client.List(context.TODO(), blueprintList)
+	if err != nil {
+		if err := client.IgnoreNotFound(err); err != nil {
+			reqLogger.Info("No bluePrint in cluster!")
+			return nil
+		}
+		return err
+	}
+	for _, blueprint := range blueprintList.Items {
+		if blueprint.Spec.ClusterServiceVersion == oldVersionName {
+			if err := r.Client.Delete(context.TODO(), &blueprint); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 func (r *BluePrintReconciler) createCRDV1(path string) error {
@@ -201,16 +318,20 @@ func (r *BluePrintReconciler) createCRDV1(path string) error {
 	if err != nil {
 		return err
 	}
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
-	config, err := k8sconfig.ClientConfig()
+	apiExtensionsClient, err := NewApiExtensionClinet()
 	if err != nil {
 		return err
 	}
-	apiextensionsClient, err := apiextensions.NewForConfig(config)
-	_, createError := apiextensionsClient.ApiextensionsV1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{})
-	if createError != nil {
-		return createError
+	_, err = apiExtensionsClient.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			_, createError := apiExtensionsClient.ApiextensionsV1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{})
+			if createError != nil {
+				return createError
+			}
+			return nil
+		}
+		return err
 	}
 	return nil
 }
@@ -221,16 +342,22 @@ func (r *BluePrintReconciler) deleteCRDV1(path string) error {
 	if err != nil {
 		return err
 	}
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
-	config, err := k8sconfig.ClientConfig()
+	apiExtensionsClient, err := NewApiExtensionClinet()
 	if err != nil {
 		return err
 	}
-	apiextensionsClient, err := apiextensions.NewForConfig(config)
-	createError := apiextensionsClient.ApiextensionsV1().CustomResourceDefinitions().Delete(context.TODO(), crd.Name, metav1.DeleteOptions{})
-	if createError != nil {
-		return createError
+
+	_, err = apiExtensionsClient.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	deleteError := apiExtensionsClient.ApiextensionsV1().CustomResourceDefinitions().Delete(context.TODO(), crd.Name, metav1.DeleteOptions{})
+	if deleteError != nil {
+		return deleteError
 	}
 	return nil
 }
@@ -241,16 +368,20 @@ func (r *BluePrintReconciler) createCRDV1Beta1(path string) error {
 	if err != nil {
 		return err
 	}
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
-	config, err := k8sconfig.ClientConfig()
+	apiExtensionsClient, err := NewApiExtensionClinet()
 	if err != nil {
 		return err
 	}
-	apiextensionsClient, err := apiextensions.NewForConfig(config)
-	_, createError := apiextensionsClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{})
-	if createError != nil {
-		return createError
+	_, err = apiExtensionsClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			_, createError := apiExtensionsClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{})
+			if createError != nil {
+				return createError
+			}
+			return nil
+		}
+		return err
 	}
 	return nil
 }
@@ -259,20 +390,23 @@ func (r *BluePrintReconciler) deleteCRDV1Beta1(path string) error {
 	crd := &apiextensionsv1beta1.CustomResourceDefinition{}
 	err := DecodeFile(path, crd)
 	if err != nil {
-		fmt.Println("////////////////////////////1")
 		return err
 	}
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
-	config, err := k8sconfig.ClientConfig()
+	apiExtensionsClient, err := NewApiExtensionClinet()
 	if err != nil {
-		fmt.Println("////////////////////////////2")
 		return err
 	}
-	apiextensionsClient, err := apiextensions.NewForConfig(config)
-	deleteError := apiextensionsClient.ApiextensionsV1beta1().CustomResourceDefinitions().Delete(context.TODO(), crd.Name, metav1.DeleteOptions{})
+
+	_, err = apiExtensionsClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	deleteError := apiExtensionsClient.ApiextensionsV1beta1().CustomResourceDefinitions().Delete(context.TODO(), crd.Name, metav1.DeleteOptions{})
 	if deleteError != nil {
-		fmt.Println("////////////////////////////3")
 		return deleteError
 	}
 	return nil
@@ -283,20 +417,19 @@ type Stepper interface {
 	Status() (operatorv1.StepStatus, error)
 }
 
-func (r *BluePrintReconciler) getRelatedReference(ClusterServiceVersionNames string) string {
-	return "./config/bundles/" + ClusterServiceVersionNames
+func (r *BluePrintReconciler) getRelatedReference(ClusterServiceVersion string) string {
+	operator, version := SplitStartingCSV(ClusterServiceVersion)
+	return "./config/bundles/" + operator + "/" + version
 }
 
-func (r *BluePrintReconciler) ParsingYaml(path string) (string,error) {
+func (r *BluePrintReconciler) ParsingYaml(path string) (string, error) {
 	resultMap := make(map[string]interface{})
 	yamlFile, err := ioutil.ReadFile(path)
 	if err != nil {
-		fmt.Println("readfile wrong!!!")
 		return "", err
 	}
 	err = yaml.Unmarshal(yamlFile, resultMap)
 	if err != nil {
-		fmt.Println("yaml.Unmarshal wrong!!!")
 		return "", err
 	}
 	switch resultMap["kind"] {
@@ -336,11 +469,18 @@ func (r *BluePrintReconciler) findCSV(step operatorv1.Step, path string) (*v1alp
 			case "operators.coreos.com/v1alpha1":
 				csv := &v1alpha1.ClusterServiceVersion{}
 				err = DecodeFile(filepathNames[i], csv)
+				csv1 := &v1alpha1.ClusterServiceVersion{
+					TypeMeta:   csv.TypeMeta,
+					ObjectMeta: csv.ObjectMeta,
+					Spec:       csv.Spec,
+					Status: v1alpha1.ClusterServiceVersionStatus{
+						Phase: v1alpha1.CSVPhasePending,
+					},
+				}
 				if err != nil {
-					fmt.Println(err.Error())
 					return nil, err
 				}
-				return csv, nil
+				return csv1, nil
 			default:
 				return nil, notSupportedStepperErr{fmt.Sprintf("stepper interface does not support %s", step.Resource.Kind)}
 			}
@@ -369,6 +509,20 @@ func DecodeFile(path string, into interface{}) error {
 	defer fileReader.Close()
 
 	decoder := yamlDecoder.NewYAMLOrJSONDecoder(fileReader, 30)
-
 	return decoder.Decode(into)
+}
+
+func now() *metav1.Time {
+	now := metav1.NewTime(utilclock.RealClock{}.Now().UTC())
+	return &now
+}
+
+func SplitStartingCSV(StartingCSV string) (string, string) {
+	return StartingCSV[:strings.IndexAny(StartingCSV, ".")], StartingCSV[strings.IndexAny(StartingCSV, ".")+1:]
+}
+
+func (r *BluePrintReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&operatorv1.BluePrint{}).
+		Complete(r)
 }

@@ -9,26 +9,6 @@ rules:
 - apiGroups:
   - operator.operator.domain
   resources:
-  - clusterserviceversions
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - operator.operator.domain
-  resources:
-  - clusterserviceversions/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - operator.operator.domain
-  resources:
   - subscriptions
   verbs:
   - create

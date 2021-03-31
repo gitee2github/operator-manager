@@ -1,34 +1,55 @@
 # Operator-manager
-<a href="https://github.com/golang/go">
-        <img src="https://img.shields.io/badge/language-Go-green.svg">
-    </a> 
-<a href="https://book.kubebuilder.io/">
-        <img src="https://img.shields.io/badge/Dependence-Kubebuilder-blue.svg">
-    </a> 
-<a href="https://operatorframework.io/">
-        <img src="https://img.shields.io/badge/Reference-OLM-brightgreen.svg">
-    </a> 
+[![](https://img.shields.io/badge/language-Go-brightgreen.svg)](https://github.com/golang/go)
+[![](https://img.shields.io/badge/Dependence-Kubebuilder-blue.svg)](https://book.kubebuilder.io/) 
+[![](https://img.shields.io/badge/Reference-OLM-important.svg)](https://operatorframework.io)
 
 ## 概览
 
-`Operator-Manager`是一套基于[kubebuilder](https://book.kubebuilder.io/) 架构设计的轻量化`Operator`管理框架，该框架主要在[kubenetes](https://kubernetes.io/) 自定义资源基础之上，通过有状态运营管理模式部署所需版本的Operator，并可支持`Operator`卸载、版本更新等操作，以实现便捷的云原生应用管理。如需详细了解`operator-manager`，请参考[详细设计]() 。
+`Operator-Manager`是一套基于[kubebuilder](https://book.kubebuilder.io/) 架构设计的轻量化`Operator`管理框架，该框架主要在[kubenetes](https://kubernetes.io/) 自定义资源基础之上，通过有状态运营管理模式部署所需版本的`Operator`，并可支持`Operator`卸载、版本更新等操作，以实现便捷的云原生应用管理。
+
+## 整体架构
+
+<img src="https://z3.ax1x.com/2021/03/31/cA4nw6.png" alt="Architecture" style="zoom:30%;" align="left"/>
+
+`Operator-Manager`的设计原则是使用`operator`管理`operator`，`operator`基于Kubernetes二次开发，可以帮助运维人员高效管理有状态应用。`operator-manager`将要管理的`operator`视为一类有状态应用，管理`operator`的`crd`、`service account`、`webhook`等依赖。
+
+`Operator-Manager`下主要基于以下三类`crd`和`controller`。
+
+| Resource              | 所属controller                    | 版本                            | Description                                                  |
+| --------------------- | -------------------------------- | --------------------------------| ------------------------------------------------------------ |
+| ClusterServiceVersion | ClusterServiceVersion_Controller | v1alpha1                        | 包括Operator的应用元数据、名称、版本、标志、所需资源、安装策略等... |
+| BluePrint             | BluePrint_Controller             | v1                              | 解析并部署csv和operator依赖的crd资源，并可基于集群内部的BluePrint实现版本管理 |
+| Subscription          | Subscription_controller          | v1                              | 与用户对接，用户通过修改部署在集群中的subscription的相关实例发起请求 |
+
+| controller                       | Creatable Resources        |
+| -------------------------------- | -------------------------- |
+| ClusterServiceVersion_Controller | Deployment                 |
+| ClusterServiceVersion_Controller | Service Account            |
+| ClusterServiceVersion_Controller | (Cluster)Roles             |
+| ClusterServiceVersion_Controller | (Cluster)RoleBindings      |
+| BluePrint_Controller             | Custom Resource Definition |
+| BluePrint_Controller             | ClusterServiceVersion      |
+| Subscription_Controller          | BluePrint                  |
+
+## 设计
+
+相比于`CoreOS`设计的[OLM](https://operatorframework.io)架构，我们设计的轻量级`operator`管理架构取消了目录管理，降低资源开销。`Operator Manager`由`Subscription Controller`、`BluePrint Controller`和`ClusterServiceVersion Controller`三个Controller组成。`Subscription Controller`负责处理用户发起的订阅请求，与[operatorhub](https://operatorhub.io/)交互，完成operator校验，并从云服务器下载所需依赖资源，解析用户订阅创建对应的`BluePrint CRD`。`BluePrint Controller`负责进行依赖解析，创建待创建/升级/回滚/删除的operator的CRD。`ClusterServiceVersion Controller`负责将待创建/升级/回滚/删除的operator通过`deployment`控制器部署到集群中去，完成依赖资源、依赖权限检查后，部署`service account`, `RBAC rules`。
 
 ## 功能概览
 
-#### 快速发起订阅请求
-完成安装与启动过程后，用户只需编辑并部署订阅信息，集群中运行的`controllers`将会依据订阅内容及时完成处理，并在完成后更新订阅状态。
+| 功能                | 完成情况           |
+| ------------------- | ------------------ |
+| 用户发起订阅请求    | :heavy_check_mark: |
+| operator 依赖解析   | :heavy_check_mark: |
+| 安装部署 operator   | :heavy_check_mark: |
+| 版本管理            | :heavy_check_mark: |
+| 绑定service account | :heavy_check_mark: |
+| 权限管理            | :heavy_check_mark: |
+| 状态检查            | :heavy_check_mark: |
+| 卸载删除 operator   | :heavy_check_mark: |
+| 对接 operatorhub.io | :heavy_check_mark: |
+| Web Dashboard       | :x:                |
 
-### operator依赖解析
-With OLMs packaging format Operators can express dependencies on the platform and on other Operators. They can rely on OLM to respect these requirements as long as the cluster is up. In this way, OLMs dependency model ensures Operators stay working during their long lifecycle across multiple updates of the platform or other Operators.
-
-### Discoverability
-OLM advertises installed Operators and their services into the namespaces of tenants. They can discover which managed services are available and which Operator provides them. Administrators can rely on catalog content projected into a cluster, enabling discovery of Operators available to install.
-
-### Cluster Stability
-Operators must claim ownership of their APIs. OLM will prevent conflicting Operators owning the same APIs being installed, ensuring cluster stability.
-
-### Declarative UI controls
-Operators can behave like managed service providers. Their user interface on the command line are APIs. For graphical consoles OLM annotates those APIs with descriptors that drive the creation of rich interfaces and forms for users to interact with the Operator in a natural, cloud-like way.
 
 ## Prerequisites
 - [git][git_tool]
@@ -80,62 +101,53 @@ Operators can behave like managed service providers. Their user interface on the
    **NOTE:** 如需删除请将`spec.option`字段修改为`delete`。
 
 3. 监测集群运行状态
-    
-    用户可根据集群打印的日志信息查看`operator-manager`的运行状态，也可以通过`kubect`指令获取`subscription`,`blueprint`,`clusterserviceversion`,`crd`,`deployment`,`pod`,`serviceaccount`等相关资源的运行状态，以检查用户订阅内容是否完成。
+   
+    用户可根据集群打印的日志信息查看`operator-manager`的运行状态，也可以通过`kubect`指令获取`subscription`,`blueprint`,`clusterserviceversion`,`crd`,`deployment`,`pod`,`serviceaccount`, `RBAC rules`等相关资源的运行状态，以检查用户订阅内容是否完成。
 
 4. 其他操作
 
     用户也可直接设计`BluePrint`的`cr`实例，完成`operator`的管理操作。但`BluePrint`的`cr`实例所需手动修改信息较多，建议用户由`Subscription`的`cr`完成`operator`管理操作。
 
-# Key Concepts
+5. 启动文件服务器
+
+    用户可接入`community-operators`目录下，执行`go mod download`操作配置`Gin`环境。执行`go run main.go`即可启动本地文件服务器。    
+
+# 关键概念
 
 ## Subscription
 
-OLM standardizes interactions with operators by requiring that the interface to an operator be via the Kubernetes API. Because we expect users to define the interfaces to their applications, OLM currently uses CRDs to define the Kubernetes API interactions.  
-
-Examples: [EtcdCluster CRD](https://github.com/operator-framework/community-operators/blob/master/community-operators/etcd/0.9.4/etcdclusters.etcd.database.coreos.com.crd.yaml), [EtcdBackup CRD](https://github.com/operator-framework/community-operators/blob/master/community-operators/etcd/0.9.4/etcdbackups.etcd.database.coreos.com.crd.yaml)
+与用户对接，用户通过修改部署在集群中的subscription的相关实例发起请求
 
 ## BluePrint
 
-OLM introduces the notion of “descriptors” of both `spec` and `status` fields in kubernetes API responses. Descriptors are intended to indicate various properties of a field in order to make decisions about their content. For example, this can drive connecting two operators together (e.g. connecting the connection string from a mysql instance to a consuming application) and be used to drive rich interactions in a UI.
-
-[See an example of a ClusterServiceVersion with descriptors](https://github.com/operator-framework/community-operators/blob/master/community-operators/etcd/0.9.2/etcdoperator.v0.9.2.clusterserviceversion.yaml)
+解析并部署`csv`和`operator`依赖的`crd`资源，并可基于集群内部的`BluePrint`实现版本管理
 
 ## ClusterServiceVersion
 
-To minimize the effort required to run an application on kubernetes, OLM handles dependency discovery and resolution of applications running on OLM.
+包含：
 
-This is achieved through additional metadata on the application definition. Each operator must define:
+- 应用元数据（名称，描述，版本定义，链接，图标，标签等）；
+- 安装策略，包括 `Operator` 安装过程中所需的部署集合和 `service accounts`，RBAC 角色和绑定等权限集合
+- CRDs：包括 `CRD` 的类型，所属服务，`Operator `交互的其他 K8s 原生资源和 `spec`，`status` 这些包含了模型语义信息的` fields` 字段描述符等。
 
- - The CRDs that it is responsible for managing. 
-   - e.g., the etcd operator manages `EtcdCluster`.
- - The CRDs that it depends on. 
-   - e.g., the vault operator depends on `EtcdCluster`, because Vault is backed by etcd.
+## CRD
 
-Basic dependency resolution is then possible by finding, for each “required” CRD, the corresponding operator that manages it and installing it as well. Dependency resolution can be further constrained by the way a user interacts with catalogs.
+为了简化在`Kubernetes`运行应用程序的成本，OLM可以通过在应用程序上定义其他元数据，发现运行的应用程序之间的依赖关系并进行解析。
+每一个`Operator`必须定义以下内容：
 
-## ClusterServiceVersion
+- 它负责管理的`CRD`，例如`Operator Etcd`用于管理`EtcdCluster`；
+- 它依赖的`CRD`，例如`Operator Valut`依赖于`EtcdCluster`，因为Valut是由etcd所支持。
+  然后，通过寻找相应的`Operator`来管理和安装应用程序所需的`CRD`，进而实现基本的依赖项解析。用户与目录进行交互的方式可能会进一步限制依赖性解析
 
-To minimize the effort required to run an application on kubernetes, OLM handles dependency discovery and resolution of applications running on OLM.
+### Controller
 
-This is achieved through additional metadata on the application definition. Each operator must define:
+Controller是 `Kubernetes` 的核心概念。控制器的工作是确保实际状态（包括集群状态，以及外部状态）与任何给定的对象的期望状态相匹配,这个过程称为 reconciling。在 `controller-runtime` 中，为特定种类实现 reconciling 的逻辑称为 `Reconciler`, 该逻辑是Controller的关键逻辑。
 
- - The CRDs that it is responsible for managing. 
-   - e.g., the etcd operator manages `EtcdCluster`.
- - The CRDs that it depends on. 
-   - e.g., the vault operator depends on `EtcdCluster`, because Vault is backed by etcd.
+## 致谢
 
-Basic dependency resolution is then possible by finding, for each “required” CRD, the corresponding operator that manages it and installing it as well. Dependency resolution can be further constrained by the way a user interacts with catalogs.
-
-### Controllers
-
-Dependency resolution is driven through the `(Group, Version, Kind)` of CRDs. This means that no updates can occur to a given CRD (of a particular Group, Version, Kind) unless they are completely backward compatible.
-
-There is no way to express a dependency on a particular version of an operator (e.g. `etcd-operator v0.9.0`) or application instance (e.g. `etcd v3.2.1`). This encourages application authors to depend on the interface and not the implementation.
-
-
-
-
+- [OpenEuler](https://openeuler.org/): `Operator-manager` 采用 OpenEuler操作系统进行项目开发；
+- [OSCHINA](https://www.oschina.net/): `Operator-manager`项目来源于OSCHINA开源比赛；
+- [鹏城实验室](https://www.pcl.ac.cn/): `Operator-manager` 项目在鹏城实验室的鲲鹏服务器上进行开发测试；
 
 [architecture]: /doc/design/architecture.md
 [philosophy]: /doc/design/philosophy.md
@@ -145,5 +157,3 @@ There is no way to express a dependency on a particular version of an operator (
 [docker_tool]:https://docs.docker.com/install/
 [kubectl_tool]:https://kubernetes.io/docs/tasks/tools/install-kubectl/
 [kubebuilder_tool]:https://book.kubebuilder.io/quick-start.html
-
-[![Kubebuilder](https://book.kubebuilder.io/logos/logo-single-line.png)](https://book.kubebuilder.io/)  [![Operatorframework](https://operatorframework.io/images/logo.svg)](https://operatorframework.io/) 

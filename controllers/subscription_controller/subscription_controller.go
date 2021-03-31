@@ -39,107 +39,67 @@ type SubscriptionReconciler struct {
 
 func (r *SubscriptionReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	_ = context.Background()
-	// Get subscription
 	reqLogger := r.Log.WithValues("Request Namespace", req.Namespace)
 	reqLogger.Info("Reconciling Subscription")
 	sub := &operatorv1.Subscription{}
-	reqLogger.Info("Start finding Subscription")
 	err := r.Client.Get(context.TODO(), req.NamespacedName, sub)
 	if err != nil {
-		reqLogger.Info("Maybe no Subscription in or get error")
 		if err := client.IgnoreNotFound(err); err == nil {
-			reqLogger.Info("Cannot found any Subscription in", req.NamespacedName)
+			reqLogger.Info("Cannot find any Subscription")
 			return ctrl.Result{}, nil
 		} else {
 			return ctrl.Result{}, err
 		}
 	}
-	//check whether the subscription file has been operated
+
 	switch sub.Status.OpStatus {
-	case "operated":
-		//operated do nothing
-		reqLogger.Info("Subscription has been operated, not need to operate again!")
+	case "present":
 		return ctrl.Result{}, nil
-	case "not operate":
-		//not operate, do create or delete by option
-		// List or create BluePrint
+	case "unknown":
+		//unknown, create or delete through sub.Spec.Option
 		blueprintList := &operatorv1.BluePrintList{}
 		err = r.Client.List(context.TODO(), blueprintList)
 		if err != nil {
 			if err := client.IgnoreNotFound(err); err == nil {
-				reqLogger.Info("Cannot found any BluePrint in", sub.Namespace)
-				return ctrl.Result{}, nil
+				reqLogger.Info("Cannot find any BluePrint locally")
 			} else {
 				return ctrl.Result{}, err
 			}
 		}
+
 		switch sub.Spec.Option {
 		case "delete":
-			//check if BluePrint already exists locally
+			//check if operator has already existed locally
 			if len(blueprintList.Items) == 0 {
 				reqLogger.Info("No need to delete!")
 			} else if len(blueprintList.Items) > 0 {
 				for _, blueprint := range blueprintList.Items {
-					csvVersion := blueprint.Spec.ClusterServiceVersionNames[0]
+					csvVersion := blueprint.Spec.ClusterServiceVersion
 					if csvVersion == sub.Spec.StartingCSV {
 						err = r.deleteBluePrint(&blueprint)
 					}
 				}
 				reqLogger.Info("All BluePrint of the specified version have been deleted!")
 			}
-			sub.Status.OpStatus = "operated"
-			err = r.Client.Update(context.TODO(), sub)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			reqLogger.Info("operate subscription successful!")
+			sub.Status.OpStatus = "present"
 		case "create":
-			//check if BluePrint already exists locally
-			if len(blueprintList.Items) != 0 {
-				flag := r.CheckSameCategory(blueprintList,sub)
-				if !flag {
-					_, err := r.ensureBlueprint(sub)
-					if err != nil {
-						return ctrl.Result{}, err
-					}
-				} else {
-					for _, blueprint := range blueprintList.Items {
-						csvVersion := blueprint.Spec.ClusterServiceVersionNames[0]
-						if csvVersion == sub.Spec.StartingCSV {
-							reqLogger.Info("Same blueprint already installed!")
-						} else {
-							if r.CompareCategory(csvVersion, sub.Spec.StartingCSV) {
-								reqLogger.Info("Delete a same category blueprint!")
-								err = r.deleteBluePrint(&blueprint)
-								if err != nil {
-									return ctrl.Result{}, err
-								}
-							}
-						}
-					}
-					_, err := r.ensureBlueprint(sub)
-					if err != nil {
-						return ctrl.Result{}, err
-					}
-				}
-			} else {
-				//There is no blueprint in the cluster,create a new one
-				_, err := r.ensureBlueprint(sub)
-				if err != nil {
-					return ctrl.Result{}, err
-				}
-				reqLogger.Info("Create a correct version BluePrint in the cluster!")
-			}
-			sub.Status.OpStatus = "operated"
-			err = r.Client.Update(context.TODO(), sub)
+			b, err := r.ensureBlueprint(reqLogger, sub, blueprintList)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			reqLogger.Info("operate subscription successful!")
+			if b == nil {
+				reqLogger.Info("Cannot find because of invalid subscription!")
+				return ctrl.Result{}, nil
+			}
+			sub.Status.OpStatus = "present"
 		}
+		err = r.Client.Update(context.TODO(), sub)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		reqLogger.Info("operate subscription successful!")
 	}
 	return ctrl.Result{}, nil
-
 }
 
 func (r *SubscriptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -148,68 +108,99 @@ func (r *SubscriptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *SubscriptionReconciler) ensureBlueprint(sub *operatorv1.Subscription) (*operatorv1.BluePrint, error) {
-	return r.createBluePrint(sub)
+func (r *SubscriptionReconciler) ensureBlueprint(reqLogger logr.Logger, sub *operatorv1.Subscription, blueprintList *operatorv1.BluePrintList) (*operatorv1.BluePrint, error) {
+	// Check from operatorhub.io and download the CSV&CRDs resources if valid
+	valid, err := checkAndDownload(SplitStartingCSV(sub.Spec.StartingCSV))
+	if !valid {
+		return nil, nil
+	}
+
+	if err != nil {
+		if err := client.IgnoreNotFound(err); err != nil {
+			return r.createBluePrint(reqLogger, sub, "NULL", operatorv1.StepStatusUnknown)
+		}
+		reqLogger.Info("Fail to check or download subscribed operator!")
+		sub.Status.OpStatus = "present"
+		err = r.Client.Update(context.TODO(), sub)
+		return nil, err
+	}
+
+	blueprint, existed, matched := r.CheckBlueprint(sub, blueprintList)
+	if !existed {
+		blueprint2, err := r.createBluePrint(reqLogger, sub, "NULL", operatorv1.StepStatusUnknown)
+		if err != nil {
+			reqLogger.Error(err, err.Error())
+		}
+		return blueprint2, err
+	}
+
+	if !matched {
+		blueprint1, err := r.createBluePrint(reqLogger, sub, blueprint.Spec.ClusterServiceVersion, operatorv1.StepStatusPresent)
+		if err != nil {
+			reqLogger.Error(err, err.Error())
+		}
+		return blueprint1, err
+	}
+	// No need to create blueprint because the subscribed blueprint already existed
+	return blueprint, nil
 }
 
-func (r *SubscriptionReconciler) createBluePrint(sub *operatorv1.Subscription) (*operatorv1.BluePrint, error) {
-
+func (r *SubscriptionReconciler) createBluePrint(reqLogger logr.Logger, sub *operatorv1.Subscription, present string, exeStatus operatorv1.StepStatus) (*operatorv1.BluePrint, error) {
 	blueprint := &operatorv1.BluePrint{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "install-",
+			GenerateName: "blueprint-",
 			Namespace:    sub.Namespace,
 		},
 		Spec: operatorv1.BluePrintSpec{
-			ClusterServiceVersionNames: []string{sub.Spec.StartingCSV},
+			ClusterServiceVersion: sub.Spec.StartingCSV,
+			OldVersion:            present,
 		},
 		Status: operatorv1.BluePrintStatus{
-			Plan: []*operatorv1.Step{
-				{
-					Resolving: "csv.v.1",
-					Resource: operatorv1.StepResource{
-						Group:    "operators.coreos.com",
-						Version:  "v1",
-						Kind:     "CustomResourceDefinition",
-						Name:     "csv.v.1",
-						Manifest: "{}",
-					},
-					Status: operatorv1.StepStatusUnknown,
+			Plan: operatorv1.Step{
+				Resolving: "csv.v.1",
+				Resource: operatorv1.StepResource{
+					Group:    "operators.coreos.com",
+					Version:  "v1",
+					Kind:     "CustomResourceDefinition",
+					Name:     "csv.v.1",
+					Manifest: "{}",
 				},
+				Status: exeStatus,
 			},
 		},
 	}
 	err := r.Client.Create(context.TODO(), blueprint)
 	if err != nil {
-		return nil, nil
+		reqLogger.Info("Create error!")
+		return nil, err
 	}
 	return blueprint, nil
 }
 
 func (r *SubscriptionReconciler) deleteBluePrint(blueprint *operatorv1.BluePrint) error {
-
-	for i, _ := range blueprint.Status.Plan {
-		blueprint.Status.Plan[i].Status = operatorv1.StepStatusDelete
-		if err := r.Client.Update(context.TODO(), blueprint); err != nil {
-			return err
-		}
+	blueprint.Status.Plan.Status = operatorv1.StepStatusDelete
+	if err := r.Client.Update(context.TODO(), blueprint); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (r *SubscriptionReconciler) CompareCategory(str1 string, str2 string) bool{
-	if str1[0:(strings.Index(str1, "."))] == str2[0:(strings.Index(str2, "."))] {
-		return true
-	}
-	return false
-}
-
-func (r *SubscriptionReconciler) CheckSameCategory(blueprintList *operatorv1.BluePrintList, sub *operatorv1.Subscription) bool{
-	var flag bool = false
+func (r *SubscriptionReconciler) CheckBlueprint(sub *operatorv1.Subscription, blueprintList *operatorv1.BluePrintList) (*operatorv1.BluePrint, bool, bool) {
 	for _, blueprint := range blueprintList.Items {
-		csvVersion := blueprint.Spec.ClusterServiceVersionNames[0]
-		if r.CompareCategory(csvVersion,sub.Spec.StartingCSV) {
-			flag = true
+		if blueprint.Spec.ClusterServiceVersion == sub.Spec.StartingCSV {
+			return &blueprint, true, true
+		}
+		if r.checkVersion(blueprint.Spec.ClusterServiceVersion, sub.Spec.StartingCSV) {
+			return &blueprint, true, false
 		}
 	}
-	return flag
+	return nil, false, false
+}
+
+func (r *SubscriptionReconciler) checkVersion(str1 string, str2 string) bool {
+	return str1[:4] == str2[:4] && str1[(strings.Index(str1, "."))+1:] != str2[(strings.Index(str2, "."))+1:]
+}
+
+func SplitStartingCSV(StartingCSV string) (string, string) {
+	return StartingCSV[:strings.IndexAny(StartingCSV, ".")], StartingCSV[strings.IndexAny(StartingCSV, ".")+1:]
 }

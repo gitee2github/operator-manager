@@ -19,33 +19,27 @@ package controllers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	util "github.com/buptGophers/operator-manager/controllers/clusterserviceversion_controller/util"
+	"github.com/buptGophers/operator-manager/controllers/clusterserviceversion_controller/util/ownerutil"
+	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
+	log "github.com/sirupsen/logrus"
+	"hash/fnv"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	apiregistration "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
-
-	util "github.com/buptGophers/operator-manager/controllers/clusterserviceversion_controller/util"
-	ownerutil "github.com/buptGophers/operator-manager/controllers/clusterserviceversion_controller/util/ownerutil"
-	"github.com/coreos/go-semver/semver"
-	log "github.com/sirupsen/logrus"
-	"hash/fnv"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilclock "k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/client-go/tools/clientcmd"
+	apiregistration "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
-	// "helm.sh/helm/v3/pkg/plugin/installer"
-
-	//"github.com/operator-framework/operator-lifecycle-manager"
-	//"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/certs"
-
-	appsv1 "k8s.io/api/apps/v1"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/rand"
@@ -53,13 +47,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha1 "github.com/buptGophers/operator-manager/api/v1alpha1"
-)
-
-var (
-	ErrRequirementsNotMet      = errors.New("requirements were not met")
-	ErrCRDOwnerConflict        = errors.New("conflicting CRD owner in namespace")
-	ErrAPIServiceOwnerConflict = errors.New("unable to adopt APIService")
+	"github.com/buptGophers/operator-manager/api/v1alpha1"
 )
 
 const (
@@ -103,14 +91,14 @@ type Strategy interface {
 
 // +kubebuilder:rbac:groups=operator.operator.domain,resources=clusterserviceversions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.operator.domain,resources=clusterserviceversions/status,verbs=get;update;patch
-
 func (r *ClusterServiceVersionReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	_ = context.Background()
 	_ = r.Log.WithValues("clusterserviceversion", req.NamespacedName)
 
-	// Get ClusterServiceVersion
+	// List ClusterServiceVersion
 	reqLogger := r.Log.WithValues("Request Namespace", req.Namespace)
 	reqLogger.Info("Reconciling ClusterServiceVersion")
+
 	csvList := &v1alpha1.ClusterServiceVersionList{}
 	err := r.Client.List(context.TODO(), csvList)
 	if err != nil {
@@ -121,80 +109,103 @@ func (r *ClusterServiceVersionReconciler) Reconcile(req ctrl.Request) (ctrl.Resu
 		reqLogger.Error(err, "unexpected error!")
 		return ctrl.Result{}, err
 	}
+
 	for _, csv := range csvList.Items {
-		strategy, err := r.UnmarshalStrategy(csv.Spec.InstallStrategy)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		// Check
-		met, statuses, err := r.requirementAndPermissionStatus(&csv, strategy)
-		if err != nil {
-			// TODO: account for Bad Rule as well
-			reqLogger.Info("invalid install strategy")
-			// csv.SetPhaseWithEvent(v1alpha1.CSVPhaseFailed, v1alpha1.CSVReasonInvalidStrategy, fmt.Sprintf("install strategy invalid: %s", err.Error()), metav1.Time{}, a.recorder)
-			return ctrl.Result{}, err
-		}
-		csv.SetRequirementStatus(statuses)
-
-		if !met {
-			reqLogger.Info("requirements were not met")
-			//csv.SetPhaseWithEventIfChanged(v1alpha1.CSVPhasePending, v1alpha1.CSVReasonRequirementsNotMet, "one or more requirements couldn't be found", now, a.recorder)
-			return ctrl.Result{}, err
-		}
-		// Create a map to track unique names
-		webhookNames := map[string]struct{}{}
-		// Check if Webhooks have valid rules and unique names
-		// TODO: Move this to validating library
-		for _, desc := range csv.Spec.WebhookDefinitions {
-			_, present := webhookNames[desc.GenerateName]
-			if present {
-				reqLogger.Error(err, "Repeated WebhookDescription name %s", desc.GenerateName)
+		switch csv.Status.Phase {
+		case v1alpha1.CSVPhasePending:
+			strategy, err := r.UnmarshalStrategy(&csv)
+			if err != nil {
 				return ctrl.Result{}, err
 			}
-			webhookNames[desc.GenerateName] = struct{}{}
-			if err = ValidWebhookRules(desc.Rules); err != nil {
-				reqLogger.Error(err, "WebhookDescription %s includes invalid rules", desc.GenerateName)
+			// Check
+			met, statuses, err := r.requirementAndPermissionStatus(&csv, strategy)
+			if err != nil {
+				// TODO: account for Bad Rule as well
+				reqLogger.Info("invalid install strategy")
 				return ctrl.Result{}, err
 			}
-		}
-		// Install owned APIServices and update strategy with serving cert data
-		updatedStrategy, err := r.installCertRequirements(&csv, strategy)
+			csv.SetRequirementStatus(statuses)
 
-		for _, strategyDetailsDeployment := range updatedStrategy.DeploymentSpecs {
-			// Install a operator strategy as a dep into cluster
-			dep, err := r.installDeployment(&csv, &strategyDetailsDeployment)
-			if err != nil {
-				reqLogger.Error(err, "failed to install strategy")
-				return ctrl.Result{}, nil
+			if !met {
+				reqLogger.Info("requirements were not met")
+				return ctrl.Result{}, err
 			}
-
-			err = r.createOrUpdateCertResourcesForDeployment(&csv, dep.GetName())
-			if err != nil {
-				reqLogger.Error(err, "failed to generate CA")
-				return ctrl.Result{}, nil
-			}
-
-			reason, ready, err := DeploymentStatus(dep)
-			if err != nil {
-				log.Debugf("deployment %s not ready before timeout: %s", dep.Name, err.Error())
-				log.Error(StrategyError{Reason: StrategyErrReasonTimeout, Message: fmt.Sprintf("deployment %s not ready before timeout: %s", dep.Name, err.Error())})
-			}
-			if !ready {
-				log.Error(StrategyError{Reason: StrategyErrReasonWaiting, Message: fmt.Sprintf("waiting for deployment %s to become ready: %s", dep.Name, reason)})
-			}
-
-			// check annotations
-			if len(csv.GetAnnotations()) > 0 && dep.Spec.Template.Annotations == nil {
-				log.Error(StrategyError{Reason: StrategyErrReasonAnnotationsMissing, Message: fmt.Sprintf("no annotations found on deployment")})
-			}
-			for key, value := range csv.GetAnnotations() {
-				if actualValue, ok := dep.Spec.Template.Annotations[key]; !ok {
-					log.Error(StrategyError{Reason: StrategyErrReasonAnnotationsMissing, Message: fmt.Sprintf("annotations on deployment does not contain expected key: %s", key)})
-				} else if dep.Spec.Template.Annotations[key] != value {
-					log.Error(StrategyError{Reason: StrategyErrReasonAnnotationsMissing, Message: fmt.Sprintf("unexpected annotation on deployment. Expected %s:%s, found %s:%s", key, value, key, actualValue)})
+			// Create a map to track unique names
+			webhookNames := map[string]struct{}{}
+			// Check if Webhooks have valid rules and unique names
+			// TODO: Move this to validating library
+			for _, desc := range csv.Spec.WebhookDefinitions {
+				_, present := webhookNames[desc.GenerateName]
+				if present {
+					reqLogger.Error(err, "Repeated WebhookDescription name %s", desc.GenerateName)
+					return ctrl.Result{}, err
+				}
+				webhookNames[desc.GenerateName] = struct{}{}
+				if err = ValidWebhookRules(desc.Rules); err != nil {
+					reqLogger.Error(err, "WebhookDescription %s includes invalid rules %s", desc.GenerateName)
+					return ctrl.Result{}, err
 				}
 			}
+
+			// Install owned APIServices and update strategy with serving cert data
+			updatedStrategy, err := r.installCertRequirements(&csv, strategy)
+			if err != nil {
+				reqLogger.Error(err, "failed to update strategy")
+				return ctrl.Result{}, nil
+			}
+
+			for _, strategyDetailsDeployment := range updatedStrategy.DeploymentSpecs {
+				// Install a operator strategy as a dep into cluster
+				dep, err := r.installDeployment(&csv, &strategyDetailsDeployment)
+				if err != nil {
+					reqLogger.Error(err, "failed to install strategy")
+					return ctrl.Result{}, nil
+				}
+
+				err = r.createOrUpdateCertResourcesForDeployment(&csv)
+				if err != nil {
+					reqLogger.Error(err, "failed to generate CA")
+					return ctrl.Result{}, nil
+				}
+
+				reason, ready, err := DeploymentStatus(dep)
+				if err != nil {
+					log.Debugf("deployment %s not ready before timeout: %s", dep.Name, err.Error())
+					log.Error(StrategyError{Reason: StrategyErrReasonTimeout, Message: fmt.Sprintf("deployment %s not ready before timeout: %s", dep.Name, err.Error())})
+				}
+				if !ready {
+					log.Info(StrategyError{Reason: StrategyErrReasonWaiting, Message: fmt.Sprintf(" for deployment %s to become ready: %s", dep.Name, reason)})
+				}
+
+				// check annotations
+				if len(csv.GetAnnotations()) > 0 && dep.Spec.Template.Annotations == nil {
+					log.Error(StrategyError{Reason: StrategyErrReasonAnnotationsMissing, Message: fmt.Sprintf("no annotations found on deployment")})
+				}
+				for key, value := range csv.GetAnnotations() {
+					if actualValue, ok := dep.Spec.Template.Annotations[key]; !ok {
+						log.Error(StrategyError{Reason: StrategyErrReasonAnnotationsMissing, Message: fmt.Sprintf("annotations on deployment does not contain expected key: %s", key)})
+					} else if dep.Spec.Template.Annotations[key] != value {
+						log.Error(StrategyError{Reason: StrategyErrReasonAnnotationsMissing, Message: fmt.Sprintf("unexpected annotation on deployment. Expected %s:%s, found %s:%s", key, value, key, actualValue)})
+					}
+				}
+			}
+			csv.SetPhase(v1alpha1.CSVPhaseSucceeded, v1alpha1.CSVReasonInstallSuccessful, "Cluster resources changed state", now())
+			if err := r.Client.Update(context.TODO(), &csv); err != nil {
+				reqLogger.Info("Update error!")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+
+		case v1alpha1.CSVPhaseDeleting:
+			if err := r.handleCSVDeletion(reqLogger, &csv); err != nil {
+				reqLogger.Error(err, err.Error())
+				return ctrl.Result{}, err
+			}
+
+		default:
+			break
 		}
+
 	}
 
 	return ctrl.Result{}, nil
@@ -218,7 +229,7 @@ type DeploymentInitializerFunc func(deployment *appsv1.Deployment) error
 type DeploymentInitializerFuncChain []DeploymentInitializerFunc
 
 func (r *ClusterServiceVersionReconciler) requirementAndPermissionStatus(csv *v1alpha1.ClusterServiceVersion, strategy Strategy) (bool, []v1alpha1.RequirementStatus, error) {
-	allReqStatuses := []v1alpha1.RequirementStatus{}
+	var allReqStatuses []v1alpha1.RequirementStatus
 	strategyDetailsDeployment, ok := strategy.(*v1alpha1.StrategyDetailsDeployment)
 	if !ok {
 		log.Error("failed to generate CA")
@@ -257,7 +268,7 @@ func (r *ClusterServiceVersionReconciler) requirementAndPermissionStatus(csv *v1
 	statuses := append(allReqStatuses, permStatuses...)
 	met := minKubeMet && reqMet && permMet
 	if !met {
-		r.Log.WithValues("minKubeMet", minKubeMet).WithValues("minKubeMet", reqMet).WithValues("reqMet", permMet).Info("permissions/requirements not met")
+		r.Log.WithValues("minKubeMet", minKubeMet).WithValues("reqMet", reqMet).WithValues("permMet", permMet).Info("permissions/requirements not met")
 	}
 
 	return met, statuses, nil
@@ -317,48 +328,11 @@ func (r *ClusterServiceVersionReconciler) minKubeVersionStatus(name string, minK
 		statuses = append(statuses, status)
 		return
 	}
-
 	status.Status = v1alpha1.RequirementStatusReasonPresent
 	status.Message = fmt.Sprintf("CSV minKubeVersion (%s) less than server version (%s)", minKubeVersion, serverVersionInfo.String())
 	met = true
 	statuses = append(statuses, status)
 	return
-}
-
-func (r *ClusterServiceVersionReconciler) installCertRequirement(csv *v1alpha1.ClusterServiceVersion, strategy Strategy) (*v1alpha1.StrategyDetailsDeployment, error) {
-	// Create the CA
-	expiration := time.Now().Add(DefaultCertValidFor)
-	ca, err := GenerateCA(expiration, Organization)
-	if err != nil {
-		log.Info("failed to generate CA")
-		return nil, err
-	}
-	rotateAt := expiration.Add(-1 * DefaultCertMinFresh)
-
-	strategyDetailsDeployment, ok := strategy.(*v1alpha1.StrategyDetailsDeployment)
-	if !ok {
-		log.Error(err, "failed to generate CA")
-		return nil, err
-	}
-	for n, d := range strategyDetailsDeployment.DeploymentSpecs {
-		certResources := r.certResourcesForDeployment(csv, d.Name)
-
-		if len(certResources) == 0 {
-			log.Info("No api or webhook descs to add CA to")
-			continue
-		}
-
-		// Update the deployment for each certResource
-		newDepSpec, caPEM, err := r.installCertRequirementsForDeployment(csv, d.Name, ca, rotateAt, d.Spec, getServicePorts(certResources))
-		if err != nil {
-			return nil, err
-		}
-
-		r.updateCertResourcesForDeployment(csv, d.Name, caPEM)
-
-		strategyDetailsDeployment.DeploymentSpecs[n].Spec = *newDepSpec
-	}
-	return strategyDetailsDeployment, nil
 }
 
 func (r *ClusterServiceVersionReconciler) requirementStatus(strategyDetailsDeployment *v1alpha1.StrategyDetailsDeployment, crdDescs []v1alpha1.CRDDescription,
@@ -444,7 +418,7 @@ func (r *ClusterServiceVersionReconciler) requirementStatus(strategyDetailsDeplo
 		}
 	}
 
-	apiregistration, err := apiregistration.NewForConfig(config)
+	apiRegistration, err := apiregistration.NewForConfig(config)
 	if err != nil {
 		return
 	}
@@ -468,7 +442,7 @@ func (r *ClusterServiceVersionReconciler) requirementStatus(strategyDetailsDeplo
 		}
 
 		// Check if APIService is registered
-		apiService, err := apiregistration.ApiregistrationV1().APIServices().Get(context.TODO(), name, metav1.GetOptions{})
+		apiService, err := apiRegistration.ApiregistrationV1().APIServices().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			status.Status = "NotPresent"
 			met = false
@@ -574,11 +548,24 @@ func (r *ClusterServiceVersionReconciler) isGVKRegistered(group, version, kind s
 }
 
 func (r *ClusterServiceVersionReconciler) permissionStatus(strategyDetailsDeployment *v1alpha1.StrategyDetailsDeployment, ruleChecker RuleChecker, targetNamespace string, csv *v1alpha1.ClusterServiceVersion) (bool, []v1alpha1.RequirementStatus, error) {
+	logger := log.WithFields(log.Fields{})
 	statusesSet := map[string]v1alpha1.RequirementStatus{}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+	config, err := k8sconfig.ClientConfig()
+	if err != nil {
+		logger.Error("CREAT K8S CONFIG ERR")
+		return false, nil, err
+	}
+	// Retrieve server k8s version
+	kubernetesClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		logger.Error("CREAT kubernetesClient ERR")
+		return false, nil, err
+	}
 
 	checkPermissions := func(permissions []v1alpha1.StrategyDeploymentPermissions, namespace string) (bool, error) {
 		met := true
-
 		for _, perm := range permissions {
 			saName := perm.ServiceAccountName
 			var status v1alpha1.RequirementStatus
@@ -595,17 +582,12 @@ func (r *ClusterServiceVersionReconciler) permissionStatus(strategyDetailsDeploy
 				status = stored
 			}
 
-			rules := clientcmd.NewDefaultClientConfigLoadingRules()
-			k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
-			config, err := k8sconfig.ClientConfig()
-
-			// Retrieve server k8s version
-			kubernetesClient, err := kubernetes.NewForConfig(config)
 			// Ensure the ServiceAccount exists
 			sa, err := kubernetesClient.CoreV1().ServiceAccounts(csv.GetNamespace()).Get(context.TODO(), perm.ServiceAccountName, metav1.GetOptions{})
 			if err != nil {
-				err, sa = r.createSA(*csv, perm.ServiceAccountName)
+				err, sa = r.createServiceAccount(csv, perm.ServiceAccountName)
 				if err != nil {
+					logger.Error("createServiceAccount ERR", err.Error())
 					met = false
 					status.Status = v1alpha1.RequirementStatusReasonNotPresent
 					status.Message = "Service account does not exist"
@@ -615,11 +597,20 @@ func (r *ClusterServiceVersionReconciler) permissionStatus(strategyDetailsDeploy
 			}
 			// Check SA's ownership
 			if ownerutil.IsOwnedByKind(sa, v1alpha1.ClusterServiceVersionKind) && !ownerutil.IsOwnedBy(sa, csv) {
-				met = false
-				status.Status = v1alpha1.RequirementStatusReasonPresentNotSatisfied
-				status.Message = "Service account is owned by another ClusterServiceVersion"
-				statusesSet[saName] = status
-				continue
+				err := kubernetesClient.CoreV1().ServiceAccounts(csv.GetNamespace()).Delete(context.TODO(), perm.ServiceAccountName, metav1.DeleteOptions{})
+				if err != nil {
+					met = false
+					continue
+				}
+				err, sa = r.createServiceAccount(csv, perm.ServiceAccountName)
+				if err != nil {
+					logger.Error("createServiceAccount ERR", err.Error())
+					met = false
+					status.Status = v1alpha1.RequirementStatusReasonNotPresent
+					status.Message = "Service account does not exist"
+					statusesSet[saName] = status
+					continue
+				}
 			}
 
 			// Check if PolicyRules are satisfied
@@ -632,6 +623,7 @@ func (r *ClusterServiceVersionReconciler) permissionStatus(strategyDetailsDeploy
 
 				marshalled, err := json.Marshal(rule)
 				if err != nil {
+					logger.Error("marshalled error")
 					dependent.Status = v1alpha1.DependentStatusReasonNotSatisfied
 					dependent.Message = "rule unmarshallable"
 					status.Dependents = append(status.Dependents, dependent)
@@ -650,6 +642,7 @@ func (r *ClusterServiceVersionReconciler) permissionStatus(strategyDetailsDeploy
 				if err != nil {
 					return false, err
 				} else if !satisfied {
+					logger.Error("Unsatisfied")
 					met = false
 					dependent.Status = v1alpha1.DependentStatusReasonNotSatisfied
 					status.Status = v1alpha1.RequirementStatusReasonPresentNotSatisfied
@@ -676,6 +669,28 @@ func (r *ClusterServiceVersionReconciler) permissionStatus(strategyDetailsDeploy
 		return false, nil, err
 	}
 
+	for _, perm := range strategyDetailsDeployment.Permissions {
+		sa, err := kubernetesClient.CoreV1().ServiceAccounts(csv.GetNamespace()).Get(context.TODO(), perm.ServiceAccountName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil, err
+		}
+		err = creatRolesAndRolebindings(sa, perm.Rules)
+		if err != nil {
+			return false, nil, err
+		}
+	}
+
+	for _, perm := range strategyDetailsDeployment.ClusterPermissions {
+		sa, err := kubernetesClient.CoreV1().ServiceAccounts(csv.GetNamespace()).Get(context.TODO(), perm.ServiceAccountName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil, err
+		}
+		err = creatClusterRolesAndClusterRolebindings(sa, perm.Rules)
+		if err != nil {
+			return false, nil, err
+		}
+	}
+
 	statuses := []v1alpha1.RequirementStatus{}
 	for key, status := range statusesSet {
 		log.WithField("key", key).WithField("status", status).Tracef("appending permission status")
@@ -700,11 +715,6 @@ func (r *ClusterServiceVersionReconciler) installDeployment(csv *v1alpha1.Cluste
 		return nil, err
 	}
 	dep := &appsv1.Deployment{Spec: d.Spec}
-	//dep, err = clientset.AppsV1().Deployments(dep.Namespace).Get(context.TODO(), dep.Name, metav1.GetOptions{})
-	//if err != nil {
-	//	fmt.Println("1111111111111111", dep.Name)
-	//	return nil, err
-	//}
 
 	dep.SetName(d.Name)
 	dep.SetNamespace(csv.GetNamespace())
@@ -719,39 +729,75 @@ func (r *ClusterServiceVersionReconciler) installDeployment(csv *v1alpha1.Cluste
 	}
 	dep.Spec.Template.SetAnnotations(annotations)
 
-	//ownerutil.AddNonBlockingOwner(dep, strategy.owner)
-	//ownerutil.AddOwnerLabelsForKind(dep, i.owner, v1alpha1.ClusterServiceVersionKind)
-	//c := DeploymentInitializerFuncChain{}
-	//if applyErr := c.Apply(dep); applyErr != nil {
-	//	err = applyErr
-	//	return
-	//}
-
-	// OLM does not support Rollbacks.
-	// By default, each deployment created by OLM could spawn up to 10 replicaSets.
-	// By setting the deployments revisionHistoryLimit to 1, OLM will only create up
-	// to 2 ReplicaSets per deployment it manages, saving memory.
 	revisionHistoryLimit := int32(1)
 	dep.Spec.RevisionHistoryLimit = &revisionHistoryLimit
-	*(dep.Spec.Replicas) = int32(3)
-	(dep.Spec.Template.Spec.Containers[0]).Command = []string{"/bin/bash", "-ce", "tail -f /dev/null"}
-	fmt.Println((dep.Spec.Template.Spec.Containers[0]).Name)
-
-	// hash := HashDeploymentSpec(dep.Spec)
-	// dep.Labels[DeploymentSpecHashLabelKey] = hash
 
 	_, err = clientset.AppsV1().Deployments(dep.Namespace).Create(context.TODO(), dep, metav1.CreateOptions{})
 	if err != nil {
 		if !k8serrors.IsAlreadyExists(err) {
 			return nil, err
 		}
-		fmt.Println("---------------qqqq")
 	}
 	return dep, nil
 }
 
-//
-func (r *ClusterServiceVersionReconciler) createOrUpdateCertResourcesForDeployment(csv *v1alpha1.ClusterServiceVersion, deploymentName string) error {
+func (r *ClusterServiceVersionReconciler) handleCSVDeletion(reqLogger logr.Logger, csv *v1alpha1.ClusterServiceVersion) error {
+	if err := r.cleanupCSVDeployments(reqLogger, csv); err != nil {
+		reqLogger.Error(err, "failed to delete strategy")
+		return nil
+	}
+	if err := r.deleteServiceAccount(csv, csv.Name); err != nil {
+		reqLogger.Error(err, "failed to delete ServiceAccount")
+		return nil
+	}
+	err := r.Client.Delete(context.TODO(), csv)
+	if err != nil {
+		return nil
+	}
+	return nil
+}
+
+func (r *ClusterServiceVersionReconciler) cleanupCSVDeployments(reqlogger logr.Logger, csv *v1alpha1.ClusterServiceVersion) error {
+	// Extract the InstallStrategy for the deployment
+	strategy, err := r.UnmarshalStrategy(csv)
+	if err != nil {
+		reqlogger.Error(err, "could not parse install strategy while cleaning up CSV deployment")
+		return err
+	}
+
+	// Assume the strategy is for a deployment
+	strategyDetailsDeployment, ok := strategy.(*v1alpha1.StrategyDetailsDeployment)
+	if !ok {
+		reqlogger.Error(err, "could not cast install strategy as type %T", strategyDetailsDeployment)
+		return err
+	}
+	kubeconfig := filepath.Join(
+		os.Getenv("HOME"), ".kube", "config",
+	)
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		reqlogger.Error(err, err.Error())
+		return err
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		reqlogger.Error(err, err.Error())
+		return err
+	}
+
+	// Delete deployments
+	for _, spec := range strategyDetailsDeployment.DeploymentSpecs {
+		if err := clientset.AppsV1().Deployments(csv.Namespace).Delete(context.TODO(), spec.Name, metav1.DeleteOptions{}); err != nil {
+			if k8serrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *ClusterServiceVersionReconciler) createOrUpdateCertResourcesForDeployment(csv *v1alpha1.ClusterServiceVersion) error {
 	for _, desc := range r.getCertResources(csv) {
 		switch d := desc.(type) {
 		case *apiServiceDescriptionsWithCAPEM:
@@ -759,76 +805,11 @@ func (r *ClusterServiceVersionReconciler) createOrUpdateCertResourcesForDeployme
 			if err != nil {
 				return err
 			}
-
-			// Cleanup legacy APIService resources
-			//err = r.deleteLegacyAPIServiceResources(*d)
-			//if err != nil {
-			//	return err
-			//}
-		//case *webhookDescriptionWithCAPEM:
-		//	err := r.createOrUpdateWebhook(csv， d.caPEM, d.webhookDescription)
-		//	if err != nil {
-		//		return err
-		//	}
 		default:
 			return fmt.Errorf("Unsupported CA Resource")
 		}
 	}
 	return nil
-
-	//for n, sddSpec := range v1alpha1.StrategyDetailsDeployment.DeploymentSpecs {
-	//	certResources := i.certResourcesForDeployment(sddSpec.Name)
-	//
-	//	if len(certResources) == 0 {
-	//		log.Info("No api or webhook descs to add CA to")
-	//		continue
-	//	}
-	//
-	//	// Update the deployment for each certResource
-	//	newDepSpec, caPEM, err := i.installCertRequirementsForDeployment(sddSpec.Name, ca, rotateAt, sddSpec.Spec, getServicePorts(certResources))
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//
-	//	i.updateCertResourcesForDeployment(sddSpec.Name, caPEM)
-	//
-	//	strategyDetailsDeployment.DeploymentSpecs[n].Spec = *newDepSpec
-	//}
-	//// [] apiServiceDescriptionsWithCAPEM{apiServiceDescriptions[i], []byte{}}
-	//apiServiceDescriptions := csv.GetAllAPIServiceDescriptions()
-	////webhook := csv.Spec.WebhookDefinitions
-	//for i, apiServiceDescriptions := range apiServiceDescriptions {
-	//	apiServiceDescriptionsWithCAPEM{			apiServiceDescription: apiServiceDescriptions,[]byte{}		}
-	//}
-	//apiServiceDescriptionsWithCAPEM{apiServiceDescription: }
-	//apiDescs := make([]certResource, len(apiServiceDescriptions))
-	//for i := range apiServiceDescriptions {
-	//	apiDescs[i] = &apiServiceDescriptionsWithCAPEM{apiServiceDescriptions[i], []byte{}}
-	//}
-	//
-	//for _, desc := range r.getCertResources() {
-	//	switch d := desc.(type) {
-	//	case *apiServiceDescriptionsWithCAPEM:
-	//		err := r.createOrUpdateAPIService(d.caPEM, d.apiServiceDescription)
-	//		if err != nil {
-	//			return err
-	//		}
-	//
-	//		// Cleanup legacy APIService resources
-	//		err = r.deleteLegacyAPIServiceResources(*d)
-	//		if err != nil {
-	//			return err
-	//		}
-	//	case *webhookDescriptionWithCAPEM:
-	//		err := r.createOrUpdateWebhook(d.caPEM, d.webhookDescription)
-	//		if err != nil {
-	//			return err
-	//		}
-	//	default:
-	//		return fmt.Errorf("Unsupported CA Resource")
-	//	}
-	//}
-	//return nil
 }
 
 // Apply runs series of overrides functions that will properly initialize
@@ -847,7 +828,8 @@ func (c DeploymentInitializerFuncChain) Apply(deployment *appsv1.Deployment) (er
 	return
 }
 
-func (r *ClusterServiceVersionReconciler) UnmarshalStrategy(s v1alpha1.NamedInstallStrategy) (strategy Strategy, err error) {
+func (r *ClusterServiceVersionReconciler) UnmarshalStrategy(csv *v1alpha1.ClusterServiceVersion) (strategy Strategy, err error) {
+	s := csv.Spec.InstallStrategy
 	switch s.StrategyName {
 	case v1alpha1.InstallStrategyNameDeployment:
 		return &s.StrategySpec, nil
@@ -894,14 +876,25 @@ func getDeploymentCondition(status appsv1.DeploymentStatus, condType appsv1.Depl
 	return nil
 }
 
-func (r *ClusterServiceVersionReconciler) createSA(csv v1alpha1.ClusterServiceVersion, name string) (error, *corev1.ServiceAccount) {
-	var secrets []corev1.LocalObjectReference
+func (r *ClusterServiceVersionReconciler) createServiceAccount(csv *v1alpha1.ClusterServiceVersion, name string) (error, *corev1.ServiceAccount) {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+	config, err := k8sconfig.ClientConfig()
+	if err != nil {
+		return err, nil
+	}
+	kubernetesClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err, nil
+	}
+	//defaultSA, err := kubernetesClient.CoreV1().ServiceAccounts(csv.GetNamespace()).Get(context.TODO(), "default", metav1.GetOptions{})
+	//var secrets []corev1.LocalObjectReference
 	blockOwnerDeletion := true
 	isController := true
-	mysecret := []string{"my-secret"}
-	for _, secretName := range mysecret {
-		secrets = append(secrets, corev1.LocalObjectReference{Name: secretName})
-	}
+	//mysecret := []string{""}
+	//for _, secretName := range mysecret {
+	//	secrets = append(secrets, corev1.LocalObjectReference{Name: secretName})
+	//}
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -917,23 +910,213 @@ func (r *ClusterServiceVersionReconciler) createSA(csv v1alpha1.ClusterServiceVe
 				},
 			},
 		},
-		ImagePullSecrets: secrets,
+		// ImagePullSecrets: secrets,
 	}
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
-	config, err := k8sconfig.ClientConfig()
-	if err != nil {
-		return err, nil
-	}
-	kubernetesClient, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return err, nil
-	}
+
 	saCreated, err := kubernetesClient.CoreV1().ServiceAccounts(csv.Namespace).Create(context.TODO(), sa, metav1.CreateOptions{})
 	if err != nil {
 		return err, nil
 	}
 	return nil, saCreated
+}
+
+func (r *ClusterServiceVersionReconciler) deleteServiceAccount(csv *v1alpha1.ClusterServiceVersion, name string) error {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+	config, err := k8sconfig.ClientConfig()
+	if err != nil {
+		return err
+	}
+	kubernetesClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+	saCreated, err := kubernetesClient.CoreV1().ServiceAccounts(csv.Namespace).Get(context.TODO(), name, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if saCreated != nil {
+		if err := kubernetesClient.CoreV1().ServiceAccounts(csv.Namespace).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
+			if k8serrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func creatRolesAndRolebindings(account *corev1.ServiceAccount, rules []rbacv1.PolicyRule) error {
+	// create Role and RoleBinding to allow the deployment to mount the pods
+	logger := log.WithFields(log.Fields{})
+	for _, rule := range rules {
+		k8srules := clientcmd.NewDefaultClientConfigLoadingRules()
+		k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(k8srules, &clientcmd.ConfigOverrides{})
+		config, err := k8sconfig.ClientConfig()
+		if err != nil {
+			return err
+		}
+		kubernetesClient, err := kubernetes.NewForConfig(config)
+		Role := &rbacv1.Role{
+			Rules: []rbacv1.PolicyRule{
+				{
+					Verbs:         rule.Verbs,
+					APIGroups:     rule.APIGroups,
+					Resources:     rule.Resources,
+					ResourceNames: rule.ResourceNames,
+				},
+			},
+		}
+		Role.SetName(account.GetName())
+		Role.SetNamespace(account.GetNamespace())
+
+		existingRole, err := kubernetesClient.RbacV1().Roles(account.GetNamespace()).Get(context.TODO(), Role.Name, metav1.GetOptions{})
+		if err == nil {
+			// Attempt an update
+			if _, err := kubernetesClient.RbacV1().Roles(account.GetNamespace()).Update(context.TODO(), existingRole, metav1.UpdateOptions{}); err != nil {
+				logger.Warnf("could not update secret role %s", Role.GetName())
+				return err
+			}
+		} else if k8serrors.IsNotFound(err) {
+			// Create the role
+			_, err = kubernetesClient.RbacV1().Roles(account.GetNamespace()).Create(context.TODO(), Role, metav1.CreateOptions{})
+			if err != nil {
+				log.Warnf("could not create secret role %s", Role.GetName())
+				return err
+			}
+		} else {
+			return err
+		}
+
+		RoleBinding := &rbacv1.RoleBinding{
+			Subjects: []rbacv1.Subject{
+				{
+					Kind:      rbacv1.ServiceAccountKind,
+					APIGroup:  "",
+					Name:      account.GetName(),
+					Namespace: account.GetNamespace(),
+				},
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: rbacv1.GroupName,
+				Kind:     "Role",
+				Name:     Role.GetName(),
+			},
+		}
+		RoleBinding.SetName(account.GetName())
+		RoleBinding.SetNamespace(account.GetNamespace())
+
+		_, err = kubernetesClient.RbacV1().RoleBindings(account.GetNamespace()).Get(context.TODO(), RoleBinding.Name, metav1.GetOptions{})
+		if err == nil {
+			// Attempt an update
+			if _, err := kubernetesClient.RbacV1().RoleBindings(account.GetNamespace()).Update(context.TODO(), RoleBinding, metav1.UpdateOptions{}); err != nil {
+				logger.Warnf("could not update rolebinding %s", RoleBinding.GetName())
+				return err
+			}
+		} else if k8serrors.IsNotFound(err) {
+			// Create the role
+			_, err = kubernetesClient.RbacV1().RoleBindings(account.GetNamespace()).Create(context.TODO(), RoleBinding, metav1.CreateOptions{})
+			if err != nil {
+				log.Warnf("could not create rolebinding")
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+	return nil
+}
+
+func creatClusterRolesAndClusterRolebindings(account *corev1.ServiceAccount, rules []rbacv1.PolicyRule) error {
+	// create Role and RoleBinding to allow the deployment to mount the pods
+	logger := log.WithFields(log.Fields{})
+	for _, rule := range rules {
+		rules := clientcmd.NewDefaultClientConfigLoadingRules()
+		k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+		config, err := k8sconfig.ClientConfig()
+		if err != nil {
+			return err
+		}
+		kubernetesClient, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			return err
+		}
+		ClusterRole := &rbacv1.ClusterRole{
+			Rules: []rbacv1.PolicyRule{
+				{
+					Verbs:         rule.Verbs,
+					APIGroups:     rule.APIGroups,
+					Resources:     rule.Resources,
+					ResourceNames: rule.ResourceNames,
+				},
+			},
+		}
+		ClusterRole.SetName(account.GetName())
+		ClusterRole.SetNamespace(account.GetNamespace())
+
+		existingRole, err := kubernetesClient.RbacV1().ClusterRoles().Get(context.TODO(), ClusterRole.Name, metav1.GetOptions{})
+		if err == nil {
+			// Attempt an update
+			if _, err := kubernetesClient.RbacV1().ClusterRoles().Update(context.TODO(), existingRole, metav1.UpdateOptions{}); err != nil {
+				logger.Warnf("could not update role %s", ClusterRole.GetName())
+				return err
+			}
+		} else if k8serrors.IsNotFound(err) {
+			// Create the role
+			_, err = kubernetesClient.RbacV1().ClusterRoles().Create(context.TODO(), ClusterRole, metav1.CreateOptions{})
+			if err != nil {
+				log.Warnf("could not create role %s", ClusterRole.GetName())
+				return err
+			}
+		} else {
+			return err
+		}
+
+		ClusterRoleBinding := &rbacv1.ClusterRoleBinding{
+			Subjects: []rbacv1.Subject{
+				{
+					Kind:      rbacv1.ServiceAccountKind,
+					APIGroup:  "",
+					Name:      account.GetName(),
+					Namespace: account.GetNamespace(),
+				},
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: rbacv1.GroupName,
+				Kind:     "ClusterRole",
+				Name:     ClusterRole.GetName(),
+			},
+		}
+		ClusterRoleBinding.SetName(account.GetName())
+		ClusterRoleBinding.SetNamespace(account.GetNamespace())
+
+		_, err = kubernetesClient.RbacV1().ClusterRoleBindings().Get(context.TODO(), ClusterRoleBinding.Name, metav1.GetOptions{})
+		if err == nil {
+			// Attempt an update
+			if _, err := kubernetesClient.RbacV1().ClusterRoleBindings().Update(context.TODO(), ClusterRoleBinding, metav1.UpdateOptions{}); err != nil {
+				logger.Warnf("could not update rolebinding %s", ClusterRoleBinding.GetName())
+				return err
+			}
+		} else if k8serrors.IsNotFound(err) {
+			// Create the role
+			_, err = kubernetesClient.RbacV1().ClusterRoleBindings().Create(context.TODO(), ClusterRoleBinding, metav1.CreateOptions{})
+			if err != nil {
+				log.Warnf("could not create rolebinding")
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+	return nil
+}
+
+func now() *metav1.Time {
+	now := metav1.NewTime(utilclock.RealClock{}.Now().UTC())
+	return &now
 }
 
 func (r *ClusterServiceVersionReconciler) SetupWithManager(mgr ctrl.Manager) error {

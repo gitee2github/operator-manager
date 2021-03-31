@@ -18,16 +18,20 @@ package controllers
 
 import (
 	"context"
-	"fmt"
+
 	operatorscoreoscomv1 "github.com/buptGophers/operator-manager/api/v1"
 	operatorscoreoscomv1alpha1 "github.com/buptGophers/operator-manager/api/v1alpha1"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
 	//corev1 "k8s.io/api/core/v1"
+	"path/filepath"
+	"testing"
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"path/filepath"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -35,8 +39,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"testing"
-	"time"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -105,7 +107,6 @@ var _ = BeforeSuite(func(done Done) {
 	Expect(k8sClient).ToNot(BeNil())
 
 	close(done)
-	//fmt.Println("@@@@@@@@@@@@@@@@@@@")
 }, 60)
 
 var _ = Describe("Subscription controller", func() {
@@ -120,46 +121,6 @@ var _ = Describe("Subscription controller", func() {
 		duration = time.Second * 10
 		interval = time.Millisecond * 250
 	)
-	/*By("bootstrapping test environment")
-	testEnv := &envtest.Environment{
-		CRDDirectoryPaths: []string{filepath.Join("..", "config", "crd", "bases")},
-	}
-	//fmt.Println("@@@@@@@@@@@@@@@@@@@0")
-	var err error
-	cfg, err = testEnv.Start()
-	if err != nil {
-
-		log.Fatal(err)
-	}
-	fmt.Println("@@@@@@@@@@@@@@@@@@@0")
-	fmt.Println("@@@@@@@@@@@@@@@@@@@0", err.Error())
-
-	Expect(err).ToNot(HaveOccurred())
-	fmt.Println("@@@@@@@@@@@@@@@@@@@1")
-	Expect(cfg).ToNot(BeNil())
-
-	err = operatorscoreoscomv1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = operatorscoreoscomv1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = operatorscoreoscomv1alpha1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-
-	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("@@@@@@@@@@@@@@@@@@@")
-	Expect(err).ToNot(HaveOccurred())
-	Expect(k8sClient).ToNot(BeNil())*/
-
-	/*k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
-	})
-	Expect(err).ToNot(HaveOccurred())*/
 
 	Context("When SubscriptionStatus is operated", func() {
 		It("Should do nothing", func() {
@@ -183,20 +144,16 @@ var _ = Describe("Subscription controller", func() {
 				},
 			}
 			Expect(k8sClient.Create(ctx, &SubscriptionTestCase1)).Should(Succeed())
-			//fmt.Println("@@@@@@@@@@@@@@@@@@@")
 
 			SubscriptionTestCase1LookupKey := types.NamespacedName{Name: SubscriptionTestCase1.Name, Namespace: SubscriptionControllerNamespace}
 			testReq := ctrl.Request{NamespacedName: SubscriptionTestCase1LookupKey}
-			//createdTestSubscription :=  &operatorscoreoscomv1.Subscription{}
 
 			_, err := (&SubscriptionReconciler{
 				Client: k8sManager.GetClient(),
 				Scheme: k8sManager.GetScheme(),
 				Log:    ctrl.Log.WithName("controllers").WithName("Subscription controller"),
 			}).Reconcile(testReq)
-			fmt.Println("@@@@@@@@@@@@@@@@@@@", err.Error())
 			Expect(err).ToNot(HaveOccurred())
-			fmt.Println("@@@@@@@@@@@@@@@@@@@")
 		})
 	})
 })
@@ -205,5 +162,4 @@ var _ = AfterSuite(func() {
 	By("tearing down the test environment")
 	err := testEnv.Stop()
 	Expect(err).ToNot(HaveOccurred())
-	fmt.Println("@@@@@@@@@@@@@@@@@@@")
 })

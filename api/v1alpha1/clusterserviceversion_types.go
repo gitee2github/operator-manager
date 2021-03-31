@@ -470,7 +470,7 @@ type RequirementStatus struct {
 // state of a system.
 type ClusterServiceVersionStatus struct {
 	// Current condition of the ClusterServiceVersion
-	Phase ClusterServiceVersionPhase `json:"phase,omitempty"`
+	Phase ClusterServiceVersionPhase `json:"phase"`
 	// A human readable message indicating details about why the ClusterServiceVersion is in this condition.
 	// +optional
 	Message string `json:"message,omitempty"`
@@ -487,6 +487,7 @@ type ClusterServiceVersionStatus struct {
 	// List of conditions, a history of state transitions
 	Conditions []ClusterServiceVersionCondition `json:"conditions,omitempty"`
 	// The status of each requirement for this CSV
+	// +optional
 	RequirementStatus []RequirementStatus `json:"requirementStatus,omitempty"`
 	// Last time the owned APIService certs were updated
 	// +optional
@@ -500,7 +501,6 @@ type ClusterServiceVersionStatus struct {
 // +genclient
 // +kubebuilder:storageversion
 // +kubebuilder:resource:shortName={csv, csvs},categories=olm
-// +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Display",type=string,JSONPath=`.spec.displayName`,description="The name of the CSV"
 // +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.spec.version`,description="The version of the CSV"
 // +kubebuilder:printcolumn:name="Replaces",type=string,JSONPath=`.spec.replaces`,description="The name of a CSV that this one replaces"
@@ -511,8 +511,7 @@ type ClusterServiceVersion struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
 
-	Spec ClusterServiceVersionSpec `json:"spec"`
-	// +optional
+	Spec   ClusterServiceVersionSpec   `json:"spec"`
 	Status ClusterServiceVersionStatus `json:"status"`
 }
 

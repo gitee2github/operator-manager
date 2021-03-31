@@ -5,10 +5,15 @@ import (
 	"fmt"
 	"github.com/buptGophers/operator-manager/api/v1alpha1"
 	"github.com/buptGophers/operator-manager/controllers/clusterserviceversion_controller/util/ownerutil"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/certs"
 	log "github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"time"
 )
 
@@ -29,14 +34,13 @@ func (r *ClusterServiceVersionReconciler) installCertRequirements(csv *v1alpha1.
 		return nil, err
 	}
 	rotateAt := expiration.Add(-1 * DefaultCertMinFresh)
-
 	for n, sddSpec := range strategyDetailsDeployment.DeploymentSpecs {
 		certResources := r.certResourcesForDeployment(csv, sddSpec.Name)
 
-		if len(certResources) == 0 {
-			log.Info("No api or webhook descs to add CA to")
-			continue
-		}
+		//if len(certResources) == 0 {
+		//	log.Info("No api or webhook descs to add CA to")
+		//	continue
+		//}
 
 		// Update the deployment for each certResource
 		newDepSpec, caPEM, err := r.installCertRequirementsForDeployment(csv, sddSpec.Name, ca, rotateAt, sddSpec.Spec, getServicePorts(certResources))
@@ -53,7 +57,22 @@ func (r *ClusterServiceVersionReconciler) installCertRequirements(csv *v1alpha1.
 
 func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(csv *v1alpha1.ClusterServiceVersion, deploymentName string, ca *KeyPair, rotateAt time.Time, depSpec appsv1.DeploymentSpec, ports []corev1.ServicePort) (*appsv1.DeploymentSpec, []byte, error) {
 	logger := log.WithFields(log.Fields{})
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	k8sconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+	config, err := k8sconfig.ClientConfig()
+	if err != nil {
+		return nil, nil, err
+	}
 
+	// Retrieve server k8s version
+	kubernetesClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, nil, err
+	}
+	servPort := corev1.ServicePort{
+		Port: int32(443),
+	}
+	ports = append(ports, servPort)
 	// Create a service for the deployment
 	service := &corev1.Service{
 		Spec: corev1.ServiceSpec{
@@ -64,21 +83,21 @@ func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(c
 	service.SetName(ServiceName(deploymentName))
 	service.SetNamespace(csv.GetNamespace())
 	ownerutil.AddNonBlockingOwner(service, csv)
-	//existingService, err := r.Client.Get(, service.GetName())
-	//if err == nil {
-	//	if !ownerutil.Adoptable(csv, existingService.GetOwnerReferences()) {
-	//		return nil, nil, fmt.Errorf("service %s not safe to replace: extraneous ownerreferences found", service.GetName())
-	//	}
-	//	service.SetOwnerReferences(existingService.GetOwnerReferences())
-	//
-	//	// Delete the Service to replace
-	//	deleteErr := i.strategyClient.GetOpClient().DeleteService(service.GetNamespace(), service.GetName(), &metav1.DeleteOptions{})
-	//	if err != nil && !k8serrors.IsNotFound(deleteErr) {
-	//		return nil, nil, fmt.Errorf("could not delete existing service %s", service.GetName())
-	//	}
-	//}
+	existingService, err := kubernetesClient.CoreV1().Services(csv.GetNamespace()).Get(context.TODO(), service.Name, metav1.GetOptions{})
+	if err == nil {
+		if !ownerutil.Adoptable(csv, existingService.GetOwnerReferences()) {
+			return nil, nil, fmt.Errorf("service %s not safe to replace: extraneous ownerreferences found", service.GetName())
+		}
+		service.SetOwnerReferences(existingService.GetOwnerReferences())
+
+		// Delete the Service to replace
+		deleteErr := kubernetesClient.CoreV1().Services(csv.GetNamespace()).Delete(context.TODO(), service.Name, metav1.DeleteOptions{})
+		if deleteErr != nil && !k8serrors.IsNotFound(deleteErr) {
+			return nil, nil, fmt.Errorf("could not delete existing service %s", service.GetName())
+		}
+	}
 	// Attempt to create the Service
-	err := r.Client.Create(context.TODO(), service)
+	service, err = kubernetesClient.CoreV1().Services(csv.GetNamespace()).Create(context.TODO(), service, metav1.CreateOptions{})
 	if err != nil {
 		logger.Warnf("could not create service %s", service.GetName())
 		return nil, nil, fmt.Errorf("could not create service %s: %s", service.GetName(), err.Error())
@@ -122,43 +141,36 @@ func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(c
 	secret.SetNamespace(csv.GetNamespace())
 	secret.SetAnnotations(map[string]string{OLMCAHashAnnotationKey: caHash})
 
-	//existingSecret, err := i.strategyClient.GetOpLister().CoreV1().SecretLister().Secrets(i.owner.GetNamespace()).Get(secret.GetName())
-	//if err == nil {
-	//	// Check if the only owners are this CSV or in this CSV's replacement chain
-	//	if ownerutil.Adoptable(i.owner, existingSecret.GetOwnerReferences()) {
-	//		ownerutil.AddNonBlockingOwner(secret, i.owner)
-	//	}
-	//
-	//	// Attempt an update
-	//	// TODO: Check that the secret was not modified
-	//	if existingCAPEM, ok := existingSecret.Data[OLMCAPEMKey]; ok && !ShouldRotateCerts(i.owner.(*v1alpha1.ClusterServiceVersion)) {
-	//		logger.Warnf("reusing existing cert %s", secret.GetName())
-	//		secret = existingSecret
-	//		caPEM = existingCAPEM
-	//		caHash = certs.PEMSHA256(caPEM)
-	//	} else if _, err := i.strategyClient.GetOpClient().UpdateSecret(secret); err != nil {
-	//		logger.Warnf("could not update secret %s", secret.GetName())
-	//		return nil, nil, err
-	//	}
-	//
-	//} else if k8serrors.IsNotFound(err) {
-	//	// Create the secret
-	//	ownerutil.AddNonBlockingOwner(secret, i.owner)
-	//	_, err = i.strategyClient.GetOpClient().CreateSecret(secret)
-	//	if err != nil {
-	//		log.Warnf("could not create secret %s", secret.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else {
-	//	return nil, nil, err
-	//}
-	ownerutil.AddNonBlockingOwner(secret, csv)
-	// Attempt to create the Service
-	err = r.Client.Create(context.TODO(), secret)
-	if err != nil {
-		log.Warnf("could not create secret %s", secret.GetName())
+	existingSecret, err := kubernetesClient.CoreV1().Secrets(csv.GetNamespace()).Get(context.TODO(), secret.Name, metav1.GetOptions{})
+	if err == nil {
+		// Check if the only owners are this CSV or in this CSV's replacement chain
+		if ownerutil.Adoptable(csv, existingSecret.GetOwnerReferences()) {
+			ownerutil.AddNonBlockingOwner(existingSecret, csv)
+		}
+
+		// Attempt an update
+		// TODO: Check that the secret was not modified
+		if existingCAPEM, ok := existingSecret.Data[OLMCAPEMKey]; ok && !ShouldRotateCerts(csv) {
+			logger.Warnf("reusing existing cert %s", existingSecret.GetName())
+			caPEM = existingCAPEM
+			caHash = certs.PEMSHA256(caPEM)
+		} else if _, err := kubernetesClient.CoreV1().Secrets(csv.GetNamespace()).Update(context.TODO(), secret, metav1.UpdateOptions{}); err != nil {
+			logger.Warnf("could not update secret %s", secret.GetName())
+			return nil, nil, err
+		}
+
+	} else if k8serrors.IsNotFound(err) {
+		// Create the secret
+		ownerutil.AddNonBlockingOwner(secret, csv)
+		_, err = kubernetesClient.CoreV1().Secrets(csv.GetNamespace()).Create(context.TODO(), secret, metav1.CreateOptions{})
+		if err != nil {
+			log.Warnf("could not create secret %s", secret.GetName())
+			return nil, nil, err
+		}
+	} else {
 		return nil, nil, err
 	}
+
 	// create Role and RoleBinding to allow the deployment to mount the Secret
 	secretRole := &rbacv1.Role{
 		Rules: []rbacv1.PolicyRule{
@@ -173,34 +185,27 @@ func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(c
 	secretRole.SetName(secret.GetName())
 	secretRole.SetNamespace(csv.GetNamespace())
 
-	//existingSecretRole, err := i.strategyClient.GetOpLister().RbacV1().RoleLister().Roles(i.owner.GetNamespace()).Get(secretRole.GetName())
-	//if err == nil {
-	//	// Check if the only owners are this CSV or in this CSV's replacement chain
-	//	if ownerutil.Adoptable(i.owner, existingSecretRole.GetOwnerReferences()) {
-	//		ownerutil.AddNonBlockingOwner(secretRole, i.owner)
-	//	}
-	//
-	//	// Attempt an update
-	//	if _, err := i.strategyClient.GetOpClient().UpdateRole(secretRole); err != nil {
-	//		logger.Warnf("could not update secret role %s", secretRole.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else if k8serrors.IsNotFound(err) {
-	//	// Create the role
-	//	ownerutil.AddNonBlockingOwner(secretRole, i.owner)
-	//	_, err = i.strategyClient.GetOpClient().CreateRole(secretRole)
-	//	if err != nil {
-	//		log.Warnf("could not create secret role %s", secretRole.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else {
-	//	return nil, nil, err
-	//}
-	ownerutil.AddNonBlockingOwner(secretRole, csv)
-	// Attempt to create the Service
-	err = r.Client.Create(context.TODO(), secretRole)
-	if err != nil {
-		log.Warnf("could not create secretRole %s", secretRole.GetName())
+	existingSecretRole, err := kubernetesClient.RbacV1().Roles(csv.GetNamespace()).Get(context.TODO(), secretRole.Name, metav1.GetOptions{})
+	if err == nil {
+		// Check if the only owners are this CSV or in this CSV's replacement chain
+		if ownerutil.Adoptable(csv, existingSecretRole.GetOwnerReferences()) {
+			ownerutil.AddNonBlockingOwner(secretRole, csv)
+		}
+
+		// Attempt an update
+		if _, err := kubernetesClient.RbacV1().Roles(csv.GetNamespace()).Update(context.TODO(), secretRole, metav1.UpdateOptions{}); err != nil {
+			logger.Warnf("could not update secret role %s", secretRole.GetName())
+			return nil, nil, err
+		}
+	} else if k8serrors.IsNotFound(err) {
+		// Create the role
+		ownerutil.AddNonBlockingOwner(secretRole, csv)
+		_, err = kubernetesClient.RbacV1().Roles(csv.GetNamespace()).Create(context.TODO(), secretRole, metav1.CreateOptions{})
+		if err != nil {
+			log.Warnf("could not create secret role %s", secretRole.GetName())
+			return nil, nil, err
+		}
+	} else {
 		return nil, nil, err
 	}
 
@@ -226,34 +231,27 @@ func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(c
 	secretRoleBinding.SetName(secret.GetName())
 	secretRoleBinding.SetNamespace(csv.GetNamespace())
 
-	//existingSecretRoleBinding, err := i.strategyClient.GetOpLister().RbacV1().RoleBindingLister().RoleBindings(i.owner.GetNamespace()).Get(secretRoleBinding.GetName())
-	//if err == nil {
-	//	// Check if the only owners are this CSV or in this CSV's replacement chain
-	//	if ownerutil.Adoptable(i.owner, existingSecretRoleBinding.GetOwnerReferences()) {
-	//		ownerutil.AddNonBlockingOwner(secretRoleBinding, i.owner)
-	//	}
-	//
-	//	// Attempt an update
-	//	if _, err := i.strategyClient.GetOpClient().UpdateRoleBinding(secretRoleBinding); err != nil {
-	//		logger.Warnf("could not update secret rolebinding %s", secretRoleBinding.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else if k8serrors.IsNotFound(err) {
-	//	// Create the role
-	//	ownerutil.AddNonBlockingOwner(secretRoleBinding, i.owner)
-	//	_, err = i.strategyClient.GetOpClient().CreateRoleBinding(secretRoleBinding)
-	//	if err != nil {
-	//		log.Warnf("could not create secret rolebinding with dep spec: %#v", depSpec)
-	//		return nil, nil, err
-	//	}
-	//} else {
-	//	return nil, nil, err
-	//}
-	ownerutil.AddNonBlockingOwner(secretRoleBinding, csv)
-	// Attempt to create the Service
-	err = r.Client.Create(context.TODO(), secretRoleBinding)
-	if err != nil {
-		log.Warnf("could not create secretRoleBinding %s", secretRoleBinding.GetName())
+	existingSecretRoleBinding, err := kubernetesClient.RbacV1().RoleBindings(csv.GetNamespace()).Get(context.TODO(), secretRoleBinding.Name, metav1.GetOptions{})
+	if err == nil {
+		// Check if the only owners are this CSV or in this CSV's replacement chain
+		if ownerutil.Adoptable(csv, existingSecretRoleBinding.GetOwnerReferences()) {
+			ownerutil.AddNonBlockingOwner(secretRoleBinding, csv)
+		}
+
+		// Attempt an update
+		if _, err := kubernetesClient.RbacV1().RoleBindings(csv.GetNamespace()).Update(context.TODO(), secretRoleBinding, metav1.UpdateOptions{}); err != nil {
+			logger.Warnf("could not update secret rolebinding %s", secretRoleBinding.GetName())
+			return nil, nil, err
+		}
+	} else if k8serrors.IsNotFound(err) {
+		// Create the role
+		ownerutil.AddNonBlockingOwner(secretRoleBinding, csv)
+		_, err = kubernetesClient.RbacV1().RoleBindings(csv.GetNamespace()).Create(context.TODO(), secretRoleBinding, metav1.CreateOptions{})
+		if err != nil {
+			log.Warnf("could not create secret rolebinding with dep spec: %#v", depSpec)
+			return nil, nil, err
+		}
+	} else {
 		return nil, nil, err
 	}
 
@@ -275,40 +273,35 @@ func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(c
 	}
 	authDelegatorClusterRoleBinding.SetName(service.GetName() + "-system:auth-delegator")
 
-	//existingAuthDelegatorClusterRoleBinding, err := i.strategyClient.GetOpLister().RbacV1().ClusterRoleBindingLister().Get(authDelegatorClusterRoleBinding.GetName())
-	//if err == nil {
-	//	// Check if the only owners are this CSV or in this CSV's replacement chain.
-	//	if ownerutil.AdoptableLabels(existingAuthDelegatorClusterRoleBinding.GetLabels(), true, i.owner) {
-	//		logger.WithFields(log.Fields{"obj": "authDelegatorCRB", "labels": existingAuthDelegatorClusterRoleBinding.GetLabels()}).Debug("adopting")
-	//		if err := ownerutil.AddOwnerLabels(authDelegatorClusterRoleBinding, i.owner); err != nil {
-	//			return nil, nil, err
-	//		}
-	//	}
-	//
-	//	// Attempt an update.
-	//	if _, err := i.strategyClient.GetOpClient().UpdateClusterRoleBinding(authDelegatorClusterRoleBinding); err != nil {
-	//		logger.Warnf("could not update auth delegator clusterrolebinding %s", authDelegatorClusterRoleBinding.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else if k8serrors.IsNotFound(err) {
-	//	// Create the role.
-	//	if err := ownerutil.AddOwnerLabels(authDelegatorClusterRoleBinding, i.owner); err != nil {
-	//		return nil, nil, err
-	//	}
-	//	_, err = i.strategyClient.GetOpClient().CreateClusterRoleBinding(authDelegatorClusterRoleBinding)
-	//	if err != nil {
-	//		log.Warnf("could not create auth delegator clusterrolebinding %s", authDelegatorClusterRoleBinding.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else {
-	//	return nil, nil, err
-	//}
-	ownerutil.AddOwnerLabels(authDelegatorClusterRoleBinding, csv)
-	err = r.Client.Create(context.TODO(), authDelegatorClusterRoleBinding)
-	if err != nil {
-		log.Warnf("could not create auth delegator clusterrolebinding %s", authDelegatorClusterRoleBinding.GetName())
+	existingAuthDelegatorClusterRoleBinding, err := kubernetesClient.RbacV1().ClusterRoleBindings().Get(context.TODO(), authDelegatorClusterRoleBinding.Name, metav1.GetOptions{})
+	if err == nil {
+		// Check if the only owners are this CSV or in this CSV's replacement chain.
+		if ownerutil.AdoptableLabels(existingAuthDelegatorClusterRoleBinding.GetLabels(), true, csv) {
+			logger.WithFields(log.Fields{"obj": "authDelegatorCRB", "labels": existingAuthDelegatorClusterRoleBinding.GetLabels()}).Debug("adopting")
+			if err := ownerutil.AddOwnerLabels(authDelegatorClusterRoleBinding, csv); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		// Attempt an update.
+		if _, err := kubernetesClient.RbacV1().ClusterRoleBindings().Update(context.TODO(), authDelegatorClusterRoleBinding, metav1.UpdateOptions{}); err != nil {
+			logger.Warnf("could not update auth delegator clusterrolebinding %s", authDelegatorClusterRoleBinding.GetName())
+			return nil, nil, err
+		}
+	} else if k8serrors.IsNotFound(err) {
+		// Create the role.
+		if err := ownerutil.AddOwnerLabels(authDelegatorClusterRoleBinding, csv); err != nil {
+			return nil, nil, err
+		}
+		_, err = kubernetesClient.RbacV1().ClusterRoleBindings().Create(context.TODO(), authDelegatorClusterRoleBinding, metav1.CreateOptions{})
+		if err != nil {
+			log.Warnf("could not create auth delegator clusterrolebinding %s", authDelegatorClusterRoleBinding.GetName())
+			return nil, nil, err
+		}
+	} else {
 		return nil, nil, err
 	}
+
 	// Create RoleBinding to extension-apiserver-authentication-reader Role in the kube-system namespace.
 	authReaderRoleBinding := &rbacv1.RoleBinding{
 		Subjects: []rbacv1.Subject{
@@ -328,37 +321,31 @@ func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(c
 	authReaderRoleBinding.SetName(service.GetName() + "-auth-reader")
 	authReaderRoleBinding.SetNamespace(KubeSystem)
 
-	//existingAuthReaderRoleBinding, err := i.strategyClient.GetOpLister().RbacV1().RoleBindingLister().RoleBindings(KubeSystem).Get(authReaderRoleBinding.GetName())
-	//if err == nil {
-	//	// Check if the only owners are this CSV or in this CSV's replacement chain.
-	//	if ownerutil.AdoptableLabels(existingAuthReaderRoleBinding.GetLabels(), true, i.owner) {
-	//		logger.WithFields(log.Fields{"obj": "existingAuthReaderRB", "labels": existingAuthReaderRoleBinding.GetLabels()}).Debug("adopting")
-	//		if err := ownerutil.AddOwnerLabels(authReaderRoleBinding, i.owner); err != nil {
-	//			return nil, nil, err
-	//		}
-	//	}
-	//	// Attempt an update.
-	//	if _, err := i.strategyClient.GetOpClient().UpdateRoleBinding(authReaderRoleBinding); err != nil {
-	//		logger.Warnf("could not update auth reader role binding %s", authReaderRoleBinding.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else if k8serrors.IsNotFound(err) {
-	//	// Create the role.
-	//	if err := ownerutil.AddOwnerLabels(authReaderRoleBinding, i.owner); err != nil {
-	//		return nil, nil, err
-	//	}
-	//	_, err = i.strategyClient.GetOpClient().CreateRoleBinding(authReaderRoleBinding)
-	//	if err != nil {
-	//		log.Warnf("could not create auth reader role binding %s", authReaderRoleBinding.GetName())
-	//		return nil, nil, err
-	//	}
-	//} else {
-	//	return nil, nil, err
-	//}
-	ownerutil.AddOwnerLabels(authReaderRoleBinding, csv)
-	err = r.Client.Create(context.TODO(), authDelegatorClusterRoleBinding)
-	if err != nil {
-		log.Warnf("could not create auth reader role binding %s", authReaderRoleBinding.GetName())
+	existingAuthReaderRoleBinding, err := kubernetesClient.RbacV1().RoleBindings(KubeSystem).Get(context.TODO(), authReaderRoleBinding.Name, metav1.GetOptions{})
+	if err == nil {
+		// Check if the only owners are this CSV or in this CSV's replacement chain.
+		if ownerutil.AdoptableLabels(existingAuthReaderRoleBinding.GetLabels(), true, csv) {
+			logger.WithFields(log.Fields{"obj": "existingAuthReaderRB", "labels": existingAuthReaderRoleBinding.GetLabels()}).Debug("adopting")
+			if err := ownerutil.AddOwnerLabels(authReaderRoleBinding, csv); err != nil {
+				return nil, nil, err
+			}
+		}
+		// Attempt an update.
+		if _, err := kubernetesClient.RbacV1().RoleBindings(KubeSystem).Update(context.TODO(), authReaderRoleBinding, metav1.UpdateOptions{}); err != nil {
+			logger.Warnf("could not update auth reader role binding %s", authReaderRoleBinding.GetName())
+			return nil, nil, err
+		}
+	} else if k8serrors.IsNotFound(err) {
+		// Create the role.
+		if err := ownerutil.AddOwnerLabels(authReaderRoleBinding, csv); err != nil {
+			return nil, nil, err
+		}
+		_, err = kubernetesClient.RbacV1().RoleBindings(KubeSystem).Create(context.TODO(), authReaderRoleBinding, metav1.CreateOptions{})
+		if err != nil {
+			log.Warnf("could not create auth reader role binding %s", authReaderRoleBinding.GetName())
+			return nil, nil, err
+		}
+	} else {
 		return nil, nil, err
 	}
 	// AddDefaultCertVolumeAndVolumeMounts(&depSpec, secret.GetName())
@@ -371,9 +358,8 @@ func (r *ClusterServiceVersionReconciler) installCertRequirementsForDeployment(c
 }
 
 func (r *ClusterServiceVersionReconciler) certResourcesForDeployment(csv *v1alpha1.ClusterServiceVersion, deploymentName string) []certResource {
-	result := []certResource{}
+	var result []certResource
 	for _, desc := range r.getCertResources(csv) {
-		fmt.Println("-------------------------", desc)
 		if desc.getDeploymentName() == deploymentName {
 			result = append(result, desc)
 		}
@@ -398,4 +384,13 @@ func (r *ClusterServiceVersionReconciler) getCertResources(csv *v1alpha1.Cluster
 		webhookDescs[i] = &webhookDescriptionWithCAPEM{csv.Spec.WebhookDefinitions[i], []byte{}}
 	}
 	return append(apiDescs, webhookDescs...)
+}
+
+func ShouldRotateCerts(csv *v1alpha1.ClusterServiceVersion) bool {
+	now := metav1.Now()
+	if !csv.Status.CertsRotateAt.IsZero() && csv.Status.CertsRotateAt.Before(&now) {
+		return true
+	}
+
+	return false
 }

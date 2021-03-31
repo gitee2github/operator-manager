@@ -34,20 +34,21 @@ spec:
         spec:
           description: BluePrintSpec defines the desired state of BluePrint
           properties:
-            clusterServiceVersionNames:
+            clusterServiceVersionName:
               description: 'INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
                 Important: Run "make" to regenerate code after modifying this file'
-              items:
-                type: string
-              type: array
+              type: string
             foo:
               description: Foo is an example field of BluePrint. Edit blueprint_types.go
                 to remove/update
               type: string
             generation:
               type: integer
+            oldVersion:
+              type: string
           required:
-          - clusterServiceVersionNames
+          - clusterServiceVersionName
+          - oldVersion
           type: object
         status:
           description: BluePrintStatus defines the observed state of BluePrint
@@ -160,39 +161,35 @@ spec:
               description: 'INSERT ADDITIONAL STATUS FIELD - define observed state
                 of cluster Important: Run "make" to regenerate code after modifying
                 this file'
-              items:
-                description: Step represents the status of an individual step in an
-                  InstallPlan.
-                properties:
-                  resolving:
-                    type: string
-                  resource:
-                    description: StepResource represents the status of a resource
-                      to be tracked by an InstallPlan.
-                    properties:
-                      group:
-                        description: CatalogSource          string `json:"sourceName"`
-                          CatalogSourceNamespace string `json:"sourceNamespace"`
-                        type: string
-                      kind:
-                        type: string
-                      manifest:
-                        type: string
-                      name:
-                        type: string
-                      version:
-                        type: string
-                    type: object
-                  status:
-                    description: StepStatus is the current status of a particular
-                      resource an in InstallPlan
-                    type: string
-                required:
-                - resolving
-                - resource
-                - status
-                type: object
-              type: array
+              properties:
+                resolving:
+                  type: string
+                resource:
+                  description: StepResource represents the status of a resource to
+                    be tracked by an InstallPlan.
+                  properties:
+                    group:
+                      description: CatalogSource          string `json:"sourceName"`
+                        CatalogSourceNamespace string `json:"sourceNamespace"`
+                      type: string
+                    kind:
+                      type: string
+                    manifest:
+                      type: string
+                    name:
+                      type: string
+                    version:
+                      type: string
+                  type: object
+                status:
+                  description: StepStatus is the current status of a particular resource
+                    an in InstallPlan
+                  type: string
+              required:
+              - resolving
+              - resource
+              - status
+              type: object
           required:
           - phase
           type: object

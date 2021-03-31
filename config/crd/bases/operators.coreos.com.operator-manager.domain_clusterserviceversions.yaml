@@ -36,8 +36,7 @@ spec:
     - csvs
     singular: clusterserviceversion
   scope: Namespaced
-  subresources:
-    status: {}
+  subresources: {}
   validation:
     openAPIV3Schema:
       description: ClusterServiceVersion is a Custom Resource of type `ClusterServiceVersionSpec`.
@@ -8618,10 +8617,13 @@ spec:
                 - version
                 type: object
               type: array
+          required:
+          - phase
           type: object
       required:
       - metadata
       - spec
+      - status
       type: object
   version: v1alpha1
   versions:
