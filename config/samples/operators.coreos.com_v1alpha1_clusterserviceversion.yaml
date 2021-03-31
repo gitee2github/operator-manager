@@ -1,0 +1,7 @@
+apiVersion: operators.coreos.com.operator-manager.domain/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  name: clusterserviceversion-sample
+spec:
+  # Add fields here
+  foo: bar

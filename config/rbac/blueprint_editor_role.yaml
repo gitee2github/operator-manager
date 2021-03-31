@@ -1,0 +1,24 @@
+# permissions for end users to edit blueprints.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blueprint-editor-role
+rules:
+- apiGroups:
+  - operators.coreos.com.operator-manager.domain
+  resources:
+  - blueprints
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - operators.coreos.com.operator-manager.domain
+  resources:
+  - blueprints/status
+  verbs:
+  - get

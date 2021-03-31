@@ -7,9 +7,9 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - cache.example.com
+  - operator.operator.domain
   resources:
-  - installplans
+  - clusterserviceversions
   verbs:
   - create
   - delete
@@ -19,15 +19,29 @@ rules:
   - update
   - watch
 - apiGroups:
-  - cache.example.com
+  - operator.operator.domain
   resources:
-  - installplans/finalizers
+  - clusterserviceversions/status
   verbs:
+  - get
+  - patch
   - update
 - apiGroups:
-  - cache.example.com
+  - operator.operator.domain
   resources:
-  - installplans/status
+  - subscriptions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - operator.operator.domain
+  resources:
+  - subscriptions/status
   verbs:
   - get
   - patch

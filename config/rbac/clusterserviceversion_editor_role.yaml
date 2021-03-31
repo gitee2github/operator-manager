@@ -1,0 +1,24 @@
+# permissions for end users to edit clusterserviceversions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clusterserviceversion-editor-role
+rules:
+- apiGroups:
+  - operators.coreos.com.operator-manager.domain
+  resources:
+  - clusterserviceversions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - operators.coreos.com.operator-manager.domain
+  resources:
+  - clusterserviceversions/status
+  verbs:
+  - get

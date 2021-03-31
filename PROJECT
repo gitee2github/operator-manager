@@ -1,13 +1,13 @@
-domain: example.com
-layout: go.kubebuilder.io/v3
-projectName: operator-manager
-repo: github.com/BUPTGophers/operator-manager
+domain: operator-manager.domain
+repo: github.com/buptGophers/operator-manager
 resources:
-- crdVersion: v1
-  group: cache
-  kind: InstallPlan
+- group: operators.coreos.com
+  kind: Subscription
   version: v1
-version: 3-alpha
-plugins:
-  manifests.sdk.operatorframework.io/v2: {}
-  scorecard.sdk.operatorframework.io/v2: {}
+- group: operators.coreos.com
+  kind: BluePrint
+  version: v1
+- group: operators.coreos.com
+  kind: ClusterServiceVersion
+  version: v1alpha1
+version: "2"

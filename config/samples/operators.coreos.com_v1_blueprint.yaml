@@ -1,0 +1,7 @@
+apiVersion: operators.coreos.com.operator-manager.domain/v1
+kind: BluePrint
+metadata:
+  name: blueprint-sample
+spec:
+  # Add fields here
+  foo: bar

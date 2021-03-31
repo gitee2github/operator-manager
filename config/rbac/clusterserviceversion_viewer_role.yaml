@@ -1,0 +1,20 @@
+# permissions for end users to view clusterserviceversions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clusterserviceversion-viewer-role
+rules:
+- apiGroups:
+  - operators.coreos.com.operator-manager.domain
+  resources:
+  - clusterserviceversions
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - operators.coreos.com.operator-manager.domain
+  resources:
+  - clusterserviceversions/status
+  verbs:
+  - get
